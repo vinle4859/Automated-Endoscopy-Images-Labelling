@@ -1,0 +1,60 @@
+# Python
+venv/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Data - NDA Protected
+data/
+*.jpg
+*.jpeg
+*.png
+*.tiff
+*.dcm
+*.nii
+*.nii.gz
+
+# Models & Checkpoints
+models/
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pb
+
+# Results & Logs
+results/
+logs/
+runs/
+*.log
+
+# Environment
+.env
+.venv
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
