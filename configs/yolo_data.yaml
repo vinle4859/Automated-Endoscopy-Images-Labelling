@@ -1,0 +1,10 @@
+path: ../data/yolo_dataset
+train: images/train
+val: images/val
+test: images/test
+
+# Classes
+names:
+  0: Malignant
+  1: Benign
+  2: NP

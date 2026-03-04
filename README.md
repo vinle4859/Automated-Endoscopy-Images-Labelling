@@ -1,52 +1,142 @@
-# Medical Imaging AI Pipeline
+# Automated Endoscopy Image Labelling
 
-**Project:** Trustworthy Endoscopic AI with YOLOv11  
-**Status:** Initial Setup  
-**Python Version:** 3.12.6
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
+
+A fully automated annotation pipeline that generates bounding-box labels for endoscopic images **without any manual annotation**. The system uses [PatchCore](https://arxiv.org/abs/2106.08265) anomaly detection with a ResNet50 backbone to localise pathological regions, then trains a [YOLOv11](https://docs.ultralytics.com/) object detector on the auto-generated labels.
+
+> **Status:** v10 (DINO self-supervised backbone) implemented, awaiting GPU cloud evaluation.
+
+---
+
+## Key Features
+
+- **Zero Manual Annotation** — PatchCore anomaly detection generates YOLO bounding boxes from image-level class labels alone
+- **Domain-Adapted Backbone** — Optional DINO self-supervised fine-tuning adapts ResNet50 features to endoscopic tissue (v10)
+- **Multi-Tier Architecture** — 10 iterative versions across 4 tiers: baseline → artifact suppression → deeper features → backbone adaptation
+- **Built-in Explainability** — Anomaly heatmap overlays and diagnostic visualisations show why each region was flagged
+- **Reproducible** — Fixed seeds, cached memory banks, timestamped run directories
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Stage 1: PatchCore Anomaly Detection                           │
+│                                                                 │
+│  Normal Images ──► ResNet50 ──► Feature Bank (300K patches)     │
+│                    (L2+L3+L4)   k-NN anomaly scoring            │
+│                                                                 │
+│  Test Image ──► Feature Extraction ──► Excess Score Map         │
+│             ──► Gaussian Smoothing ──► Adaptive Threshold       │
+│             ──► Bbox Extraction ──► YOLO-format labels          │
+├─────────────────────────────────────────────────────────────────┤
+│  Stage 2: YOLOv11-nano Object Detection                         │
+│                                                                 │
+│  Auto-generated labels ──► YOLOv11 training ──► Detector        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Backbone options:**
+- **ImageNet** (default) — Frozen ResNet50 with ImageNet weights
+- **DINO** (v10) — Self-supervised fine-tuned ResNet50 on 5,957 Normal endoscopic images
 
 ## Quick Start
 
-1. **Activate Virtual Environment:**
-   ```powershell
-   venv\Scripts\activate
-   ```
+### Prerequisites
 
-2. **Install Dependencies:**
-   ```powershell
-   pip install -r requirements.txt
-   ```
+- Python 3.10+
+- (Optional) NVIDIA GPU with ≥8 GB VRAM for DINO fine-tuning
+- ≥32 GB RAM recommended for full pipeline (16 GB sufficient for v6–v8)
 
-3. **Verify Installation:**
-   ```powershell
-   python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-   ```
+### Installation
+
+```bash
+git clone https://github.com/vinle4859/Automated-Endoscopy-Images-Labelling.git
+cd Automated-Endoscopy-Images-Labelling
+
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# Linux/macOS
+source .venv/bin/activate
+
+# CPU
+pip install -r requirements.txt
+
+# GPU (recommended)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+### Usage
+
+```bash
+# Run the full pipeline (generate bboxes + train YOLO)
+python src/main.py --step all
+
+# Run with DINO backbone (v10 — requires GPU for fine-tuning)
+python src/main.py --step finetune --finetune-epochs 100
+python src/main.py --step all --backbone dino
+
+# Cloud comparative study (v9 vs v10)
+python run_cloud.py --all
+```
 
 ## Project Structure
 
 ```
-Med_Img_Project/
-├── data/              # All datasets (git-ignored, NDA protected)
-├── models/            # Model weights and checkpoints (git-ignored)
-├── src/               # Source code
-├── configs/           # Configuration files
-├── notebooks/         # Jupyter notebooks for exploration
-├── results/           # Training results and metrics (git-ignored)
-├── docs/              # Documentation
-└── IMPLEMENTATION_PLAN.md  # Detailed implementation guide
+Automated-Endoscopy-Images-Labelling/
+├── src/                        # Source code
+│   ├── main.py                 #   CLI entry point
+│   ├── generate_bboxes.py      #   PatchCore anomaly detection + bbox pipeline
+│   ├── finetune_backbone.py    #   DINO self-supervised backbone training
+│   ├── train_yolo.py           #   YOLOv11-nano training
+│   ├── run_manager.py          #   Timestamped run directory management
+│   ├── diagnose_signal.py      #   Signal diagnostic visualisations
+│   ├── diagnose_v4.py          #   Heatmap overlay diagnostics
+│   └── validate_bboxes.py      #   Automated bbox quality validation
+├── run_cloud.py                # Cloud orchestration (v9 vs v10 comparison)
+├── configs/
+│   └── yolo_data.yaml          # YOLO dataset paths + class names
+├── docs/                       # Technical documentation
+├── data/                       # Datasets (git-ignored, see below)
+├── models/                     # Weights and feature banks (git-ignored)
+├── results/                    # Training outputs (git-ignored)
+├── VERSION_REGISTRY.md         # Complete version history (v1–v10)
+├── requirements.txt
+└── LICENSE
 ```
 
-## Key Features
+## Version History
 
-- **Semi-Automated Labeling:** AI-assisted annotation workflow
-- **Hierarchical Classification:** Multi-level diagnostic taxonomy
-- **Quality-First Approach:** Automated data validation before training
-- **Built-in Explainability:** Grad-CAM and attention visualizations
-- **Multi-Modal Fusion:** Support for combining image + clinical data
+The pipeline evolved through 10 versions across 4 tiers. See [VERSION_REGISTRY.md](VERSION_REGISTRY.md) for the complete record with parameters, results, and failure analysis.
 
-## Next Steps
+| Version | Tier | Key Change | YOLO mAP50 | Status |
+|---------|------|------------|------------|--------|
+| v1–v5 | 0 | Core PatchCore development | — | Superseded |
+| v6 | 0 | Bbox merging + adaptive threshold | **0.181** | Baseline |
+| v7–v8 | 1 | Specular + hair suppression | 0.075 | Evaluated |
+| v9 | 2 | Layer 4 features (3584-dim) | OOM | Needs ≥32 GB RAM |
+| v10 | 3 | DINO self-supervised backbone | TBD | Awaiting cloud |
 
-Refer to [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for detailed implementation guide.
+**Key finding:** Artifact suppression (Tier 1) reached diminishing returns — further masking hurt true anomaly signal more than it helped specificity. The path forward is better features via deeper layers (Tier 2) and domain-adapted backbones (Tier 3).
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [VERSION_REGISTRY.md](VERSION_REGISTRY.md) | Complete version history with parameters, results, and failure analysis |
+| [METHOD_3_PATCHCORE_IMPLEMENTATION.md](docs/METHOD_3_PATCHCORE_IMPLEMENTATION.md) | Core PatchCore algorithm documentation |
+| [PROJECT_REVIEW_AND_ROADMAP.md](docs/PROJECT_REVIEW_AND_ROADMAP.md) | Gap analysis and execution roadmap |
+| [AUTOMATED_ANNOTATION_STRATEGIES.md](docs/AUTOMATED_ANNOTATION_STRATEGIES.md) | Methodology evolution narrative |
+| [METHOD_2_UNET_AUTOENCODER.md](docs/METHOD_2_UNET_AUTOENCODER.md) | Failed U-Net approach (negative result) |
+| [BBOX_MERGE_VS_SPLIT.md](docs/BBOX_MERGE_VS_SPLIT.md) | Bbox merging design decisions |
 
 ## Data Privacy
 
-All data in `data/`, `models/`, and `results/` directories are excluded from Git due to potential NDA restrictions.
+All data in `data/`, `models/`, and `results/` directories are excluded from version control. Medical images may be subject to NDA restrictions.
+
+## License
+
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
