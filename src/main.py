@@ -1,7 +1,7 @@
 import os
 import sys
 import argparse
-from generate_bboxes import generate_dataset
+from generate_bboxes import generate_dataset, run_v11_gate_sweep, run_v12_advanced
 
 # Default path for DINO-finetuned backbone weights
 DINO_BACKBONE_PATH = os.path.join(
@@ -29,6 +29,18 @@ def main():
                              f"({DINO_BACKBONE_PATH}).")
     parser.add_argument('--finetune-epochs', type=int, default=100,
                         help="Number of DINO fine-tuning epochs (default: 100).")
+    parser.add_argument('--anom-floor', type=float, default=None,
+                        help="Override ANOMALY_FLOOR_THRESH for generation.")
+    parser.add_argument('--anom-margin', type=float, default=None,
+                        help="Override ANOMALY_MARGIN_FRAC for generation.")
+    parser.add_argument('--calibration-percentile', type=float, default=99,
+                        help="Normal calibration percentile (default: 99).")
+    parser.add_argument('--sweep-gates', action='store_true',
+                        help="Run v11 gate sensitivity sweep before generation.")
+    parser.add_argument('--v12-advanced', action='store_true',
+                        help="Run v12 advanced A/B sweep across backbones, then generate with best config.")
+    parser.add_argument('--disable-v11-roi', action='store_true',
+                        help="Disable v11 ROI mask and border rejection.")
 
     args = parser.parse_args()
 
@@ -39,7 +51,10 @@ def main():
             backbone_path = DINO_BACKBONE_PATH
 
     # Determine version tag for session
-    version = 'v10' if backbone_path else 'v9'
+    if args.v12_advanced:
+        version = 'v13'
+    else:
+        version = 'v10' if backbone_path else 'v9'
 
     print("==================================================")
     print("   Trustworthy Endoscopic AI Pipeline Started     ")
@@ -70,8 +85,29 @@ def main():
         print("\n--- STEP 1: Generating Bounding Boxes via PatchCore Feature-Space Anomaly Detection ---")
         backbone_label = f"DINO ({backbone_path})" if backbone_path else "ImageNet (frozen)"
         print(f"    (Backbone: {backbone_label})")
-        generate_dataset(rebuild_bank=args.rebuild_bank, session=session,
-                         backbone_path=backbone_path)
+        if args.v12_advanced:
+            run_v12_advanced(
+                rebuild_bank=args.rebuild_bank,
+                session=session,
+                dino_backbone_path=DINO_BACKBONE_PATH if os.path.isfile(DINO_BACKBONE_PATH) else None,
+            )
+        else:
+            best_cfg = None
+            if args.sweep_gates:
+                best_cfg, _ = run_v11_gate_sweep(backbone_path=backbone_path,
+                                                 rebuild_bank=args.rebuild_bank,
+                                                 session=session)
+            generate_dataset(
+                rebuild_bank=args.rebuild_bank,
+                session=session,
+                backbone_path=backbone_path,
+                anom_floor=(best_cfg['floor'] if best_cfg else args.anom_floor),
+                anom_margin=(best_cfg['margin'] if best_cfg else args.anom_margin),
+                calibration_percentile=(best_cfg['calibration_percentile']
+                                        if best_cfg else args.calibration_percentile),
+                v11_mode=not args.disable_v11_roi,
+                v13_mode=True,
+            )
 
     if args.step in ['yolo', 'all']:
         print("\n--- STEP 2: Training YOLOv11 Detector ---")

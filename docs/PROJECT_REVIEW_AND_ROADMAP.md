@@ -1,8 +1,81 @@
 # Project Review, Gap Analysis & Roadmap
 
 **Project:** Trustworthy Endoscopic AI Pipeline with YOLOv11  
-**Date:** February 22, 2026  
+**Date:** February 22, 2026 (with 2026-03-13 and 2026-03-14 addenda below)  
 **Scope:** Full codebase review — objective alignment, implementation adequacy, prioritised improvements
+
+---
+
+## 0. Validation Addendum (2026-03-13)
+
+This addendum supersedes any older statements in this document that claim
+the pipeline is ready for YOLO retraining after v6-only validation.
+
+### Verified outcomes from latest advanced run
+
+- Run artifact: `results/logs/v12_advanced_20260313_104726.log`
+- Selected backbone: ImageNet (DINO sweep objective collapsed to 0.0)
+- Best selected sensitivity params: percentile=99, margin=0.08, floor=0.03
+- Normal negative-control false positives: 13/32 (40.6%)
+- Train non-empty labels: 62/228 (27.19%)
+- Edge-centered boxes: 0.0%
+- Quality gate pass: False
+
+### Validation status of safeguards
+
+- YOLO dataset path bug fixed (`configs/yolo_data.yaml` now points to
+  `data/yolo_dataset`), preventing the prior v10 path resolution failure.
+- Automatic no-go gate is active: `data/yolo_dataset/quality_gate.json`
+  reports `overall_pass=false` on current data.
+- Training block is implemented in `src/train_yolo.py`; YOLO training is
+  intentionally blocked unless label quality thresholds are met, or the
+  operator explicitly uses `--force-bad-labels`.
+
+### Roadmap adjustment
+
+The immediate blocker is no longer infrastructure/runtime stability, but
+label quality trade-offs (low abnormal coverage with high Normal FP).
+
+Priority next versions:
+
+1. v13: soften border suppression and improve signal-to-bbox conversion
+   (dual-threshold/seed-grow extraction).
+2. v13: make gates class-aware using confidence CSVs and per-class coverage.
+3. v14: hybrid proposal-refinement (PatchCore proposals + Med-SAM refinement)
+   if v13 cannot reduce Normal FP while lifting coverage.
+
+---
+
+## 0b. Validation Addendum (2026-03-14, v13 Completed)
+
+### Verified outcomes from v13 advanced run
+
+- Run A artifact: `results/logs/v13_advanced_20260313_154100.log`
+- Run A directory: `results/runs/20260313_161640_generate/`
+- Run B artifact: `results/logs/v13_advanced_20260314_163000.log`
+- Run B directory: `results/runs/20260314_171000_generate/`
+- Selected backbone: ImageNet
+- Selected params: percentile=99, margin=0.06, floor=0.04
+- Train non-empty labels: 202/228 (88.6%)
+- Normal negative-control false positives: 22/32 (68.8%)
+- Edge-centered boxes: 9.42%
+- Quality gate: **PASS** (`overall_pass=true`)
+
+Both runs are legitimate and materially consistent, with the second run serving
+as independent reproducibility confirmation rather than replacement.
+
+### Key implication
+
+v13 fixed the low-coverage failure mode from v11/v12, but exposed a gate-design
+failure mode: the current gate can pass while specificity collapses on Normal
+controls.
+
+### Mandatory governance upgrade before trusted YOLO retraining
+
+1. Add explicit Normal-control criterion to gate (e.g., `normal_fp_pct <= 20`).
+2. Add objective terms for pseudo-label precision, not only coverage/edge rate.
+3. Track and threshold bbox-to-signal expansion from confidence CSV diagnostics.
+4. Keep `--force-bad-labels` only for research mode, never default workflows.
 
 ---
 
@@ -13,7 +86,7 @@ endoscopic images using YOLOv11 object detection. The pipeline must:
 
 | Requirement | Source |
 |---|---|
-| **R1** Automatically generate bounding box annotations from image-level class labels — no manual medical annotation | IMPLEMENTATION_PLAN.md §Quick Start |
+| **R1** Automatically generate bounding box annotations from image-level class labels — no manual medical annotation | README.md + VERSION_REGISTRY.md |
 | **R2** Train YOLOv11 for real-time detection of Malignant, Benign, and NP (Nasal Polyp) lesions | Phase 5–7 |
 | **R3** Provide built-in explainability (XAI) so clinicians can audit model reasoning | Phase 9 |
 | **R4** Support hierarchical classification and multi-modal late fusion (stretch goals) | Phases 3, 8 |
@@ -80,7 +153,7 @@ the design of its successor. Full documentation exists in `docs/AUTOMATED_ANNOTA
 | `src/generate_bboxes.py` | PatchCore pipeline: extract features, build bank, score images, produce YOLO labels with train/val/test splits, confidence logging, data validation, Normal negative control | ✅ Updated |
 | `src/main.py` | CLI orchestrator (`--step generate\|yolo\|all`, `--rebuild-bank`) | ✅ Updated |
 | `src/train_yolo.py` | YOLO v11-nano training with medical-sensible augmentation, early stopping (patience=10), test evaluation | ✅ Updated |
-| `src/validate_params.py` | Quick 3-image/class pre-flight parameter validation with 3-panel visualisation | ✅ Active |
+| `src/diagnose_signal.py` | Signal diagnostic tooling for anomaly-map behavior checks | ✅ Active |
 | `src/diagnose_v4.py` | 5-panel diagnostic visualisation for PatchCore debugging | ✅ Active |
 | `configs/yolo_data.yaml` | YOLO dataset config — train/val/test paths, 3 classes | ✅ Updated |
 | `models/patchcore_bank.npz` | Normal memory bank (float16, 500K patches) + ceiling | ✅ Generated (~880 MB) |

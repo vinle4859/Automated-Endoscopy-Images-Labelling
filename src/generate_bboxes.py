@@ -23,6 +23,9 @@ import sys
 import cv2
 import shutil
 import hashlib
+import json
+import itertools
+from contextlib import contextmanager
 import torch
 import torch.nn as nn
 import numpy as np
@@ -182,12 +185,90 @@ HAIR_COVERAGE        = 0.25  # stricter than v8 (0.15): require more patch
 # This is aggressive but justified: tumors are central ("between the walls").
 EDGE_SUPPRESS_PX     = 2     # border pixels to zero at feature resolution
 
+# ── v11 ROI-aware glare rejection ───────────────────────────────────────────
+# Corner glare and dark circular border can dominate anomaly maps on the DINO
+# branch. v11 adds tissue-ROI masking and border-component rejection.
+ENABLE_FOV_MASK       = True
+FOV_INTENSITY_THRESH  = 12    # grayscale threshold to separate tissue from black rim
+FOV_MIN_COVERAGE      = 0.08  # minimum area for valid FOV component
+BORDER_REJECT_MARGIN  = 4     # reject components too close to feature-map border
+
+# ── v13 extraction improvements ────────────────────────────────────────────
+# v13 replaces hard border-component rejection with soft border score decay,
+# and uses a dual-threshold seed-grow mask to preserve weak contiguous lesion
+# signal around strong anomaly cores.
+ENABLE_V13_SOFT_BORDER = True
+SOFT_BORDER_MARGIN_PX  = 4      # ramp width (feature-map pixels)
+SOFT_BORDER_MIN_WEIGHT = 0.35   # weight at border (center remains 1.0)
+ENABLE_V13_DUAL_THRESH = True
+DUAL_THRESH_LOW_RATIO  = 0.55   # low threshold = high_threshold * ratio
+DUAL_THRESH_LOW_FLOOR  = 0.015  # absolute floor for grow mask
+
 # ImageNet normalisation required for pretrained ResNet weights
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 # Classes to annotate (Normal is excluded; used only for the memory bank)
 CLASSES = {"Malignant": 0, "Benign": 1, "NP": 2}
+
+
+@contextmanager
+def _temporary_param_overrides(overrides):
+    """Temporarily override module-level tuning constants."""
+    if not overrides:
+        yield
+        return
+    old_vals = {}
+    for k, v in overrides.items():
+        if k in globals():
+            old_vals[k] = globals()[k]
+            globals()[k] = v
+    try:
+        yield
+    finally:
+        for k, v in old_vals.items():
+            globals()[k] = v
+
+
+def get_fov_mask(img_path, fH, fW):
+    """
+    Estimate endoscope field-of-view mask at feature-map resolution.
+
+    Keeps the largest non-black component. This removes circular black rims
+    and corner regions that commonly trigger glare-driven false boxes.
+    """
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return np.ones((fH, fW), dtype=bool)
+
+    mask = (img > FOV_INTENSITY_THRESH).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+
+    n_lbl, lbl, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if n_lbl <= 1:
+        return np.ones((fH, fW), dtype=bool)
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    best = int(np.argmax(areas)) + 1
+    full = (lbl == best).astype(np.float32)
+    if full.mean() < FOV_MIN_COVERAGE:
+        return np.ones((fH, fW), dtype=bool)
+
+    down = cv2.resize(full, (fW, fH), interpolation=cv2.INTER_AREA)
+    return down > 0.5
+
+
+def _compute_soft_border_weights(h, w, margin_px, min_weight):
+    """Return a feature-map weight matrix that softly attenuates border scores."""
+    if margin_px <= 0:
+        return np.ones((h, w), dtype=np.float32)
+
+    yy, xx = np.indices((h, w))
+    dist = np.minimum.reduce([yy, xx, h - 1 - yy, w - 1 - xx]).astype(np.float32)
+    ramp = np.clip(dist / float(margin_px), 0.0, 1.0)
+    return min_weight + (1.0 - min_weight) * ramp
 
 
 # ── Data quality pre-check ─────────────────────────────────────────────────────
@@ -487,6 +568,70 @@ def calibrate_normal_score(bank, k, extractor, transform, device,
 
 
 # ── Anomaly map computation ────────────────────────────────────────────────────
+def compute_raw_patch_scores(extractor, img_path, nbrs, transform, device):
+    """Compute raw k-NN patch scores at feature-map resolution."""
+    img = Image.open(img_path).convert('RGB')
+    tensor = transform(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feat = extractor(tensor)
+    _, C, fH, fW = feat.shape
+    patches = feat.squeeze(0).permute(1, 2, 0).reshape(-1, C).cpu().numpy()
+    dists, _ = nbrs.kneighbors(patches)
+    scores = dists.mean(axis=1).reshape(fH, fW).astype(np.float32)
+    return scores
+
+
+def raw_scores_to_anomaly_map(raw_scores, img_path, score_ceiling, orig_w,
+                              orig_h):
+    """Convert raw k-NN scores to uint8 anomaly map using current settings."""
+    fH, fW = raw_scores.shape
+
+    # Step 1: subtractive baseline
+    excess = np.maximum(raw_scores - score_ceiling, 0.0)
+
+    # Step 2: edge suppression
+    if EDGE_SUPPRESS_PX > 0:
+        n = EDGE_SUPPRESS_PX
+        excess[:n, :] = 0.0
+        excess[-n:, :] = 0.0
+        excess[:, :n] = 0.0
+        excess[:, -n:] = 0.0
+
+    # Step 2b: specular suppression
+    spec_mask = get_specular_mask(img_path, fH, fW)
+    excess[spec_mask] = 0.0
+
+    # Step 2c: hair suppression
+    hair_mask = get_hair_mask(img_path, fH, fW)
+    excess[hair_mask] = 0.0
+
+    # Step 2d: v11 FOV suppression
+    if ENABLE_FOV_MASK:
+        fov_mask = get_fov_mask(img_path, fH, fW)
+        excess[~fov_mask] = 0.0
+
+    # Step 2e: v13 soft border attenuation (replaces hard component rejection).
+    if ENABLE_V13_SOFT_BORDER:
+        wmap = _compute_soft_border_weights(
+            fH, fW, SOFT_BORDER_MARGIN_PX, SOFT_BORDER_MIN_WEIGHT
+        )
+        excess *= wmap
+
+    # Step 3: density smoothing
+    excess_smooth = cv2.GaussianBlur(
+        excess.astype(np.float32),
+        (SCORE_SMOOTH_KERNEL, SCORE_SMOOTH_KERNEL),
+        SCORE_SMOOTH_SIGMA
+    )
+
+    # Step 4: normalise
+    margin = score_ceiling * ANOMALY_MARGIN_FRAC
+    normed = np.clip(excess_smooth / (margin + 1e-8), 0.0, 1.0)
+    amap = (normed * 255).astype(np.uint8)
+    amap = cv2.resize(amap, (orig_w, orig_h))
+    return amap
+
+
 def compute_anomaly_map(extractor, img_path, nbrs, score_ceiling,
                         transform, device, orig_w, orig_h):
     """
@@ -508,73 +653,10 @@ def compute_anomaly_map(extractor, img_path, nbrs, score_ceiling,
 
     Returns a uint8 (orig_h, orig_w) heatmap.
     """
-    img    = Image.open(img_path).convert('RGB')
-    tensor = transform(img).unsqueeze(0).to(device)
-    with torch.no_grad():
-        feat = extractor(tensor)                                      # (1,C,fH,fW)
-    _, C, fH, fW = feat.shape
-    patches = feat.squeeze(0).permute(1, 2, 0).reshape(-1, C).cpu().numpy()
-
-    dists, _ = nbrs.kneighbors(patches)                              # (fH*fW, k)
-    scores   = dists.mean(axis=1).reshape(fH, fW).astype(np.float32)
-
-    # ── v5: Density-smoothed scoring ───────────────────────────────────────
-    # Step 1: Subtractive baseline — zero out everything within Normal range.
-    excess = np.maximum(scores - score_ceiling, 0.0)
-
-    # Step 2: Edge suppression at feature-map resolution BEFORE smoothing.
-    # This prevents edge artifacts from bleeding into central regions during
-    # the Gaussian blur step.
-    if EDGE_SUPPRESS_PX > 0:
-        n = EDGE_SUPPRESS_PX
-        excess[:n, :]  = 0.0
-        excess[-n:, :] = 0.0
-        excess[:, :n]  = 0.0
-        excess[:, -n:] = 0.0
-
-    # Step 2b: Specular suppression (v7) — zero out patches whose receptive
-    # field is dominated by specular reflections.  The v5 comment below
-    # explains why density smoothing alone was insufficient:
-    #   Diagnostic (2026-02-24) showed that specular hotspots on NORMAL images
-    #   score 41.9 vs ceiling 37.7, pushing them into the above-ceiling range
-    #   and causing Normal FPs (17/32 = 53%).  Meanwhile the weakest true
-    #   anomalies (NP) peak at 42.5 — only 0.6 above the specular-inflated
-    #   Normal baseline.  Zeroing speculars before smoothing removes this
-    #   contamination without the over-suppression issues of v4/v5-alpha
-    #   (those operated at full pixel resolution; here we mask at feature-map
-    #   resolution with a 25% coverage threshold, which is much more targeted).
-    spec_mask = get_specular_mask(img_path, fH, fW)
-    excess[spec_mask] = 0.0
-
-    # Step 2c: Hair artifact suppression (v8) — zero out patches whose
-    # receptive field is dominated by hair strands.  Hair is thin dark
-    # lines on bright mucosa, rarely present in the Normal bank, so
-    # PatchCore scores it as highly anomalous.  Same mechanism as
-    # specular suppression: mask at feature-map resolution before
-    # smoothing so hair cannot inflate the density estimate.
-    hair_mask = get_hair_mask(img_path, fH, fW)
-    excess[hair_mask] = 0.0
-
-    # Step 3: Gaussian smooth at feature-map resolution (32×32).
-    # This is the KEY v5 change.  Smoothing acts as a spatial density
-    # estimator: large regions with many moderate-anomaly patches (= tumors)
-    # maintain strong signal, while isolated high-scoring patches (= edge
-    # artifacts, specular spots, texture noise) are diluted.
-    excess_smooth = cv2.GaussianBlur(
-        excess.astype(np.float32),
-        (SCORE_SMOOTH_KERNEL, SCORE_SMOOTH_KERNEL),
-        SCORE_SMOOTH_SIGMA
-    )
-
-    # Step 4: Normalise smoothed excess.  Use reduced margin because
-    # smoothing spreads energy — peak values decrease ~3-4×.
-    margin = score_ceiling * ANOMALY_MARGIN_FRAC
-    normed = np.clip(excess_smooth / (margin + 1e-8), 0.0, 1.0)
-
-    amap   = (normed * 255).astype(np.uint8)
-    amap   = cv2.resize(amap, (orig_w, orig_h))
-
-    return amap
+    raw_scores = compute_raw_patch_scores(extractor, img_path, nbrs,
+                                          transform, device)
+    return raw_scores_to_anomaly_map(raw_scores, img_path, score_ceiling,
+                                     orig_w, orig_h)
 
 # ── Bounding box extraction (v6: adaptive threshold + merging) ─────────────────
 def _merge_bboxes(bboxes, gap_frac):
@@ -635,7 +717,7 @@ def _merge_bboxes(bboxes, gap_frac):
     return bboxes
 
 
-def extract_bboxes(amap, orig_w, orig_h):
+def extract_bboxes(amap, orig_w, orig_h, param_overrides=None):
     """
     Convert an anomaly heatmap to 0–N YOLO bounding boxes.
 
@@ -653,10 +735,11 @@ def extract_bboxes(amap, orig_w, orig_h):
 
     Returns list of (xc, yc, w, h) tuples in YOLO normalised format.
     """
-    # Downsample to feature-map resolution.  INTER_AREA preserves average
-    # intensity, preventing aliasing from discarding hot pixels.
-    fmap = cv2.resize(amap, (FEATURE_MAP_RES, FEATURE_MAP_RES),
-                      interpolation=cv2.INTER_AREA)
+    with _temporary_param_overrides(param_overrides):
+        # Downsample to feature-map resolution. INTER_AREA preserves average
+        # intensity, preventing aliasing from discarding hot pixels.
+        fmap = cv2.resize(amap, (FEATURE_MAP_RES, FEATURE_MAP_RES),
+                          interpolation=cv2.INTER_AREA)
 
     # ── Adaptive threshold (v6) ───────────────────────────────────────────
     # Fixed threshold (v5: 0.08) was too rigid — it either missed broad
@@ -664,91 +747,385 @@ def extract_bboxes(amap, orig_w, orig_h):
     # v6: apply Otsu on the nonzero pixels.  This finds the natural split
     # between background (normal tissue → 0 from subtractive scoring) and
     # anomaly signal, adapting per-image to the actual signal strength.
-    nonzero_mask = fmap > 0
-    nonzero_vals = fmap[nonzero_mask]
-    if len(nonzero_vals) > 0:
-        # Otsu on the nonzero distribution
-        otsu_thr, _ = cv2.threshold(nonzero_vals, 0, 255,
-                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Floor: never go below ANOMALY_FLOOR_THRESH to prevent noise
-        floor_val = int(255 * ANOMALY_FLOOR_THRESH)
-        thr_val = max(int(otsu_thr), floor_val)
-    else:
-        return []  # no anomaly signal at all
+        nonzero_mask = fmap > 0
+        nonzero_vals = fmap[nonzero_mask]
+        if len(nonzero_vals) > 0:
+            # Otsu on the nonzero distribution
+            otsu_thr, _ = cv2.threshold(nonzero_vals, 0, 255,
+                                        cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Floor: never go below ANOMALY_FLOOR_THRESH to prevent noise
+            floor_val = int(255 * ANOMALY_FLOOR_THRESH)
+            thr_val = max(int(otsu_thr), floor_val)
+        else:
+            return []  # no anomaly signal at all
 
-    _, thresh = cv2.threshold(fmap, thr_val, 255, cv2.THRESH_BINARY)
+        if ENABLE_V13_DUAL_THRESH:
+            # v13: seed-grow extraction to keep weak lesion shoulders connected
+            # to confident cores while suppressing global low-level noise.
+            high_thr = thr_val
+            low_floor = int(255 * DUAL_THRESH_LOW_FLOOR)
+            low_thr = max(int(high_thr * DUAL_THRESH_LOW_RATIO), low_floor)
+
+            seed_mask = (fmap >= high_thr).astype(np.uint8)
+            grow_mask = (fmap >= low_thr).astype(np.uint8)
+            if seed_mask.sum() == 0:
+                return []
+
+            n_grow, grow_lbl, _, _ = cv2.connectedComponentsWithStats(grow_mask)
+            thresh = np.zeros_like(grow_mask, dtype=np.uint8)
+            for lid in range(1, n_grow):
+                comp = (grow_lbl == lid)
+                if np.any(seed_mask[comp] > 0):
+                    thresh[comp] = 255
+        else:
+            _, thresh = cv2.threshold(fmap, thr_val, 255, cv2.THRESH_BINARY)
 
     # Bridge adjacent patches (5×5 dilate at 32×32 bridges wider gaps
     # between hotspot clusters within the same tumor)
-    k_bridge = np.ones((BRIDGE_DILATE_K, BRIDGE_DILATE_K), np.uint8)
-    bridged  = cv2.dilate(thresh, k_bridge, iterations=1)
+        k_bridge = np.ones((BRIDGE_DILATE_K, BRIDGE_DILATE_K), np.uint8)
+        bridged = cv2.dilate(thresh, k_bridge, iterations=1)
 
     # Close to fill internal gaps within a cluster (v6: 5×5 kernel)
-    k_close = np.ones((5, 5), np.uint8)
-    closed  = cv2.morphologyEx(bridged, cv2.MORPH_CLOSE, k_close)
+        k_close = np.ones((5, 5), np.uint8)
+        closed = cv2.morphologyEx(bridged, cv2.MORPH_CLOSE, k_close)
 
     # Connected components at feature resolution
-    n_labels, labels, comp_stats, _ = cv2.connectedComponentsWithStats(closed)
-    if n_labels <= 1:
-        return []
+        n_labels, labels, comp_stats, _ = cv2.connectedComponentsWithStats(closed)
+        if n_labels <= 1:
+            return []
 
     # Score each component by its mean anomaly intensity (for sorting)
-    comp_scores = []
-    for label_id in range(1, n_labels):
-        mask = (labels == label_id)
-        mean_val = float(fmap[mask].mean()) / 255.0
-        comp_scores.append((label_id, mean_val))
-    # Sort by mean anomaly score (strongest first)
-    comp_scores.sort(key=lambda x: x[1], reverse=True)
+        comp_scores = []
+        for label_id in range(1, n_labels):
+            mask = (labels == label_id)
+            mean_val = float(fmap[mask].mean()) / 255.0
+            comp_scores.append((label_id, mean_val))
+        # Sort by mean anomaly score (strongest first)
+        comp_scores.sort(key=lambda x: x[1], reverse=True)
 
-    bboxes = []
-    for label_id, mean_score in comp_scores:
-        x_feat = comp_stats[label_id, cv2.CC_STAT_LEFT]
-        y_feat = comp_stats[label_id, cv2.CC_STAT_TOP]
-        w_feat = comp_stats[label_id, cv2.CC_STAT_WIDTH]
-        h_feat = comp_stats[label_id, cv2.CC_STAT_HEIGHT]
+        bboxes = []
+        for label_id, mean_score in comp_scores:
+            x_feat = comp_stats[label_id, cv2.CC_STAT_LEFT]
+            y_feat = comp_stats[label_id, cv2.CC_STAT_TOP]
+            w_feat = comp_stats[label_id, cv2.CC_STAT_WIDTH]
+            h_feat = comp_stats[label_id, cv2.CC_STAT_HEIGHT]
+
+            # v11 fallback: reject border-touching components only when v13
+            # soft-border attenuation is disabled.
+            if (not ENABLE_V13_SOFT_BORDER) and BORDER_REJECT_MARGIN > 0:
+                if (x_feat <= BORDER_REJECT_MARGIN or y_feat <= BORDER_REJECT_MARGIN or
+                    x_feat + w_feat >= FEATURE_MAP_RES - BORDER_REJECT_MARGIN or
+                    y_feat + h_feat >= FEATURE_MAP_RES - BORDER_REJECT_MARGIN):
+                    continue
 
         # Convert from feature-grid coordinates to normalised [0,1]
-        x_min = x_feat / FEATURE_MAP_RES
-        y_min = y_feat / FEATURE_MAP_RES
-        w_norm = w_feat / FEATURE_MAP_RES
-        h_norm = h_feat / FEATURE_MAP_RES
+            x_min = x_feat / FEATURE_MAP_RES
+            y_min = y_feat / FEATURE_MAP_RES
+            w_norm = w_feat / FEATURE_MAP_RES
+            h_norm = h_feat / FEATURE_MAP_RES
 
         # Add padding to cover lesion margins beyond the detected patches
-        x_min = max(0.0, x_min - BBOX_PAD_FRAC)
-        y_min = max(0.0, y_min - BBOX_PAD_FRAC)
-        w_norm = min(1.0 - x_min, w_norm + 2 * BBOX_PAD_FRAC)
-        h_norm = min(1.0 - y_min, h_norm + 2 * BBOX_PAD_FRAC)
+            x_min = max(0.0, x_min - BBOX_PAD_FRAC)
+            y_min = max(0.0, y_min - BBOX_PAD_FRAC)
+            w_norm = min(1.0 - x_min, w_norm + 2 * BBOX_PAD_FRAC)
+            h_norm = min(1.0 - y_min, h_norm + 2 * BBOX_PAD_FRAC)
 
         # Area check in normalised coordinates
-        area_frac = w_norm * h_norm
-        if area_frac < MIN_BBOX_AREA_FRAC:
-            continue
-        if area_frac > MAX_BBOX_AREA_FRAC:
-            continue
+            area_frac = w_norm * h_norm
+            if area_frac < MIN_BBOX_AREA_FRAC:
+                continue
+            if area_frac > MAX_BBOX_AREA_FRAC:
+                continue
 
         # YOLO format: center_x, center_y, width, height (all 0–1)
-        xc = x_min + w_norm / 2.0
-        yc = y_min + h_norm / 2.0
-        bboxes.append((xc, yc, w_norm, h_norm))
+            xc = x_min + w_norm / 2.0
+            yc = y_min + h_norm / 2.0
+            bboxes.append((xc, yc, w_norm, h_norm))
 
     # ── Bbox merging (v6) ─────────────────────────────────────────────────
     # Merge nearby bboxes that belong to the same tumor mass.  A single
     # lesion can produce 2-3 disconnected hotspot clusters — merging them
     # gives YOLO one cohesive annotation per lesion.
-    bboxes = _merge_bboxes(bboxes, BBOX_MERGE_GAP_FRAC)
+        bboxes = _merge_bboxes(bboxes, BBOX_MERGE_GAP_FRAC)
 
     # Post-merge area check: merged boxes may now exceed MAX_BBOX_AREA_FRAC
-    bboxes = [b for b in bboxes
+        bboxes = [b for b in bboxes
               if MIN_BBOX_AREA_FRAC <= b[2] * b[3] <= MAX_BBOX_AREA_FRAC]
 
     # Sort by area (largest first) and limit
-    bboxes.sort(key=lambda b: b[2] * b[3], reverse=True)
-    bboxes = bboxes[:MAX_BBOXES_PER_IMAGE]
+        bboxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+        bboxes = bboxes[:MAX_BBOXES_PER_IMAGE]
 
-    return bboxes
+        return bboxes
 
-def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
+
+def compute_label_quality_metrics(output_root=OUTPUT_ROOT):
+    """Compute gate metrics from generated YOLO label files."""
+    metrics = {}
+    total_boxes = 0
+    total_edge = 0
+    for split in ('train', 'val', 'test'):
+        lbl_dir = os.path.join(output_root, 'labels', split)
+        files = []
+        if os.path.isdir(lbl_dir):
+            files = sorted(f for f in os.listdir(lbl_dir) if f.endswith('.txt'))
+        non_empty = 0
+        boxes = 0
+        edge = 0
+        for fn in files:
+            txt = open(os.path.join(lbl_dir, fn)).read().strip()
+            if txt:
+                non_empty += 1
+            for line in txt.splitlines():
+                s = line.split()
+                if len(s) >= 5:
+                    boxes += 1
+                    xc = float(s[1]); yc = float(s[2])
+                    if xc < 0.2 or xc > 0.8 or yc < 0.2 or yc > 0.8:
+                        edge += 1
+        total_boxes += boxes
+        total_edge += edge
+        metrics[split] = {
+            'labels': len(files),
+            'non_empty': non_empty,
+            'non_empty_pct': (100.0 * non_empty / max(len(files), 1)),
+            'boxes': boxes,
+            'edge_box_pct': (100.0 * edge / max(boxes, 1)),
+        }
+    metrics['overall'] = {
+        'boxes': total_boxes,
+        'edge_box_pct': (100.0 * total_edge / max(total_boxes, 1)),
+    }
+    return metrics
+
+
+def evaluate_quality_gate(metrics, min_non_empty_pct=30.0,
+                          max_edge_box_pct=20.0):
+    """Return pass/fail booleans for resource-saving YOLO blocking."""
+    train_pct = metrics.get('train', {}).get('non_empty_pct', 0.0)
+    edge_pct = metrics.get('overall', {}).get('edge_box_pct', 100.0)
+    return {
+        'train_non_empty_pass': train_pct >= min_non_empty_pct,
+        'edge_box_pass': edge_pct <= max_edge_box_pct,
+        'overall_pass': (train_pct >= min_non_empty_pct and
+                         edge_pct <= max_edge_box_pct),
+        'thresholds': {
+            'min_non_empty_pct': min_non_empty_pct,
+            'max_edge_box_pct': max_edge_box_pct,
+        }
+    }
+
+
+def _collect_normal_patch_scores(extractor, nbrs, transform, device):
+    """Collect raw normal patch scores once so percentile ceilings are cheap."""
+    primary_normal = NORMAL_DIRS[0]
+    files = sorted(f for f in os.listdir(primary_normal)
+                   if f.lower().endswith(('.png', '.jpg', '.jpeg')))
+    all_scores = []
+    for fname in tqdm(files, desc="  Collect normal scores"):
+        img = Image.open(os.path.join(primary_normal, fname)).convert('RGB')
+        tensor = transform(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            feat = extractor(tensor)
+        patches = feat.squeeze(0).permute(1, 2, 0).reshape(-1, feat.shape[1]).cpu().numpy()
+        dists, _ = nbrs.kneighbors(patches)
+        all_scores.extend(dists.mean(axis=1).tolist())
+    return np.array(all_scores, dtype=np.float32)
+
+
+def _build_extractor_and_knn(backbone_path=None, rebuild_bank=False,
+                             calibration_percentile=99, collect_normal_scores=False):
+    """Shared setup for generation and sweep logic."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    extractor = PatchCoreExtractor(backbone_path=backbone_path).to(device).eval()
+    transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+
+    bank_cache = BANK_CACHE_PATH.replace('.npz', '_dino.npz') if backbone_path else BANK_CACHE_PATH
+
+    _probe = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE).to(device)
+    with torch.no_grad():
+        expected_dim = extractor(_probe).shape[1]
+    del _probe
+
+    bank = None
+    if not rebuild_bank and os.path.exists(bank_cache):
+        cached = np.load(bank_cache)
+        bank = cached['bank'].astype(np.float32)
+        if bank.shape[1] != expected_dim:
+            bank = None
+            rebuild_bank = True
+
+    if bank is None:
+        bank = build_memory_bank(extractor, NORMAL_DIRS, transform, device)
+        os.makedirs(os.path.dirname(bank_cache), exist_ok=True)
+        np.savez_compressed(bank_cache, bank=bank.astype(np.float16))
+
+    nbrs = NearestNeighbors(n_neighbors=K_NEIGHBORS, algorithm='brute',
+                            metric='euclidean', n_jobs=-1)
+    nbrs.fit(bank)
+    normal_scores = None
+    if collect_normal_scores:
+        normal_scores = _collect_normal_patch_scores(extractor, nbrs, transform,
+                                                     device)
+        ceiling = float(np.percentile(normal_scores, calibration_percentile))
+    else:
+        ceiling = calibrate_normal_score(bank, K_NEIGHBORS, extractor, transform,
+                                         device, percentile=calibration_percentile)
+    return extractor, nbrs, transform, device, ceiling, normal_scores
+
+
+def run_v11_gate_sweep(backbone_path=None, rebuild_bank=False, session=None,
+                       sample_per_class=24):
+    """
+    Run sensitivity sweep for v11 gate metrics and return best parameter set.
+
+    Sweep objective: maximize abnormal bbox coverage while penalizing
+    edge-centered detections and Normal false positives.
+    """
+    print("\n=== v11 Gate Sensitivity Sweep ===")
+    extractor, nbrs, transform, device, _, normal_scores = _build_extractor_and_knn(
+        backbone_path=backbone_path,
+        rebuild_bank=rebuild_bank,
+        calibration_percentile=99,
+        collect_normal_scores=True,
+    )
+
+    # Build evaluation image set: sampled abnormal + all Normal test images
+    eval_images = []
+    for cls in CLASSES.keys():
+        cdir = os.path.join(DATA_ROOT, cls)
+        files = sorted([f for f in os.listdir(cdir)
+                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        for fn in files[:sample_per_class]:
+            eval_images.append((cls, os.path.join(cdir, fn), True))
+
+    ntest = os.path.join(TEST_ROOT, 'Normal')
+    if os.path.isdir(ntest):
+        for fn in sorted(os.listdir(ntest)):
+            if fn.lower().endswith(('.png', '.jpg', '.jpeg')):
+                eval_images.append(('Normal', os.path.join(ntest, fn), False))
+
+    # Cache raw score maps once
+    raw_cache = {}
+    for cls, path, is_abn in tqdm(eval_images, desc="  Precompute raw scores"):
+        bgr = cv2.imread(path)
+        if bgr is None:
+            continue
+        h, w = bgr.shape[:2]
+        raw = compute_raw_patch_scores(extractor, path, nbrs, transform, device)
+        raw_cache[path] = (cls, is_abn, raw, w, h)
+
+    calib_grid = [95, 97, 99]
+    margin_grid = [0.06, 0.08, 0.10, 0.12]
+    floor_grid = [0.01, 0.02, 0.03, 0.04]
+
+    rows = []
+    ceiling_map = {p: float(np.percentile(normal_scores, p)) for p in calib_grid}
+
+    for calib, margin, floor in itertools.product(calib_grid, margin_grid, floor_grid):
+        ceiling = ceiling_map[calib]
+
+        n_abn = 0
+        abn_detect = 0
+        n_norm = 0
+        norm_fp = 0
+        boxes = 0
+        edge_boxes = 0
+
+        overrides = {
+            'ANOMALY_MARGIN_FRAC': margin,
+            'ANOMALY_FLOOR_THRESH': floor,
+            'ENABLE_FOV_MASK': True,
+        }
+        with _temporary_param_overrides(overrides):
+            for path, (cls, is_abn, raw, w, h) in raw_cache.items():
+                amap = raw_scores_to_anomaly_map(raw, path, ceiling, w, h)
+                bbs = extract_bboxes(amap, w, h)
+                if is_abn:
+                    n_abn += 1
+                    if bbs:
+                        abn_detect += 1
+                else:
+                    n_norm += 1
+                    if bbs:
+                        norm_fp += 1
+
+                for (xc, yc, bw, bh) in bbs:
+                    boxes += 1
+                    if xc < 0.2 or xc > 0.8 or yc < 0.2 or yc > 0.8:
+                        edge_boxes += 1
+
+        abn_cov = 100.0 * abn_detect / max(n_abn, 1)
+        norm_fp_pct = 100.0 * norm_fp / max(n_norm, 1)
+        edge_pct = 100.0 * edge_boxes / max(boxes, 1)
+        objective = abn_cov - 0.6 * edge_pct - 0.5 * norm_fp_pct
+        rows.append({
+            'calibration_percentile': calib,
+            'margin': margin,
+            'floor': floor,
+            'abnormal_coverage_pct': round(abn_cov, 3),
+            'normal_fp_pct': round(norm_fp_pct, 3),
+            'edge_box_pct': round(edge_pct, 3),
+            'objective': round(objective, 3),
+        })
+
+    rows.sort(key=lambda r: r['objective'], reverse=True)
+    best = rows[0]
+
+    out_dir = os.path.join(PROJECT_ROOT, 'results', 'v11_sweeps')
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, 'latest_sweep.json')
+    with open(out_path, 'w') as f:
+        json.dump({'best': best, 'results': rows}, f, indent=2)
+
+    print(f"  Sweep finished. Best config: {best}")
+    print(f"  Sweep report: {out_path}")
+    return best, out_path
+
+
+def run_v12_advanced(rebuild_bank=False, session=None, dino_backbone_path=None):
+    """
+    v12 advanced mode: sweep both ImageNet and DINO backbones, pick best,
+    then generate labels with that configuration.
+    """
+    print("\n=== v12 Advanced Backbone A/B ===")
+    candidates = [('ImageNet', None)]
+    if dino_backbone_path and os.path.isfile(dino_backbone_path):
+        candidates.append(('DINO', dino_backbone_path))
+
+    best_global = None
+    best_backbone = None
+    for name, bb_path in candidates:
+        print(f"\n  Sweeping backbone: {name}")
+        best, _ = run_v11_gate_sweep(backbone_path=bb_path,
+                                     rebuild_bank=rebuild_bank,
+                                     session=session)
+        if best_global is None or best['objective'] > best_global['objective']:
+            best_global = best
+            best_backbone = bb_path
+
+    print(f"\n  Selected backbone: {'DINO' if best_backbone else 'ImageNet'}")
+    print(f"  Selected params: {best_global}")
+
+    generate_dataset(
+        rebuild_bank=rebuild_bank,
+        session=session,
+        backbone_path=best_backbone,
+        anom_floor=best_global['floor'],
+        anom_margin=best_global['margin'],
+        calibration_percentile=best_global['calibration_percentile'],
+        v11_mode=True,
+    )
+
+def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
+                     anom_floor=None, anom_margin=None,
+                     calibration_percentile=99, v11_mode=True,
+                     v13_mode=True,
+                     min_non_empty_pct=30.0, max_edge_box_pct=20.0):
     """
     PatchCore-based pipeline:
     1. Load cached Normal memory bank, or build + cache it if absent / forced.
@@ -796,13 +1173,21 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
 
     # ── Determine version and tier based on backbone selection ───────────────
     if backbone_path is not None:
-        _version = 'v10'
+        _version = 'v13' if v13_mode else ('v11' if v11_mode else 'v10')
         _tier = 'Tier3_DINO'
         _backbone_label = f'DINO ({os.path.basename(backbone_path)})'
     else:
-        _version = 'v9'
+        _version = 'v13' if v13_mode else ('v11' if v11_mode else 'v9')
         _tier = 'Tier2_Layer4'
         _backbone_label = 'ImageNet (default)'
+
+    param_overrides = {
+        'ANOMALY_FLOOR_THRESH': anom_floor if anom_floor is not None else ANOMALY_FLOOR_THRESH,
+        'ANOMALY_MARGIN_FRAC': anom_margin if anom_margin is not None else ANOMALY_MARGIN_FRAC,
+        'ENABLE_FOV_MASK': bool(v11_mode),
+        'ENABLE_V13_SOFT_BORDER': bool(v13_mode),
+        'ENABLE_V13_DUAL_THRESH': bool(v13_mode),
+    }
 
     # ── Timestamped run directory for visualisations ──────────────────────────
     # Imports run_manager here (not at module level) to avoid circular deps
@@ -810,8 +1195,8 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
     try:
         from run_manager import create_run_dir
         run_dir = create_run_dir('generate', version=_version, params={
-            'ANOMALY_FLOOR_THRESH': ANOMALY_FLOOR_THRESH,
-            'ANOMALY_MARGIN_FRAC': ANOMALY_MARGIN_FRAC,
+            'ANOMALY_FLOOR_THRESH': param_overrides['ANOMALY_FLOOR_THRESH'],
+            'ANOMALY_MARGIN_FRAC': param_overrides['ANOMALY_MARGIN_FRAC'],
             'BBOX_MERGE_GAP_FRAC': BBOX_MERGE_GAP_FRAC,
             'MIN_BBOX_AREA_FRAC': MIN_BBOX_AREA_FRAC,
             'MAX_BBOX_AREA_FRAC': MAX_BBOX_AREA_FRAC,
@@ -826,6 +1211,10 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
             'MAX_BANK_PATCHES': MAX_BANK_PATCHES,
             'TIER': _tier,
             'BACKBONE': _backbone_label,
+            'CALIBRATION_PERCENTILE': calibration_percentile,
+            'ENABLE_FOV_MASK': bool(v11_mode),
+            'ENABLE_V13_SOFT_BORDER': bool(v13_mode),
+            'ENABLE_V13_DUAL_THRESH': bool(v13_mode),
         }, session=session)
         vis_dir_root = os.path.join(run_dir, 'visualizations')
     except ImportError:
@@ -887,7 +1276,8 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
             # may differ from what was cached (v1: bank self-scoring).
             print("  Recalibrating ceiling on full Normal images …")
             score_ceiling = calibrate_normal_score(
-                bank, K_NEIGHBORS, extractor, transform, device
+                bank, K_NEIGHBORS, extractor, transform, device,
+                percentile=calibration_percentile
             )
 
     if bank is None:
@@ -908,7 +1298,8 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
 
         # Calibrate before saving — uses extractor to score full Normal images
         score_ceiling = calibrate_normal_score(
-            bank, K_NEIGHBORS, extractor, transform, device
+            bank, K_NEIGHBORS, extractor, transform, device,
+            percentile=calibration_percentile
         )
 
         os.makedirs(os.path.dirname(bank_cache), exist_ok=True)
@@ -957,7 +1348,7 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
 
         n_with_box = 0
         n_no_box   = 0
-        confidence_log = []    # (fname, peak_score, n_bboxes)
+        confidence_log = []    # (fname, peak_score, n_bboxes, signal_frac, bbox_frac, ratio)
         for i, fname in enumerate(tqdm(file_list, desc=f"  {class_name}/{split}")):
             img_path = os.path.join(source_dir, fname)
 
@@ -976,11 +1367,19 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
             peak_score = float(amap.max()) / 255.0
 
             bboxes = extract_bboxes(amap, orig_w, orig_h)
+
+            # Diagnose bbox-vs-heatmap size mismatch for failure-mode analysis.
+            signal_mask = amap > 0
+            signal_frac = float(signal_mask.mean())
+            bbox_frac = float(sum((bw * bh) for (_, _, bw, bh) in bboxes))
+            bbox_to_signal = bbox_frac / max(signal_frac, 1e-8)
+
             if bboxes:
                 n_with_box += 1
             else:
                 n_no_box += 1
-            confidence_log.append((fname, peak_score, len(bboxes)))
+            confidence_log.append((fname, peak_score, len(bboxes),
+                                   signal_frac, bbox_frac, bbox_to_signal))
 
             # Diagnostic visualisation (train split only, first N)
             if do_visualise and i < VISUAL_SAMPLE:
@@ -994,7 +1393,9 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
 
                 fig, axes = plt.subplots(1, 3, figsize=(15, 5))
                 axes[0].imshow(orig_rgb);  axes[0].set_title('Original');         axes[0].axis('off')
-                axes[1].imshow(amap, cmap='hot'); axes[1].set_title('PatchCore Anomaly Map'); axes[1].axis('off')
+                axes[1].imshow(amap, cmap='hot', vmin=0, vmax=255)
+                axes[1].set_title(f'PatchCore Anomaly Map (peak={peak_score:.3f})')
+                axes[1].axis('off')
                 axes[2].imshow(vis_img);   axes[2].set_title('Predicted BBox');   axes[2].axis('off')
                 plt.suptitle(f"{class_name} — {fname}", fontsize=10)
                 plt.tight_layout()
@@ -1010,66 +1411,70 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
         # Persist per-image confidence metadata
         conf_csv = os.path.join(OUTPUT_ROOT, f'confidence_{split}_{class_name}.csv')
         with open(conf_csv, 'w') as cf:
-            cf.write('filename,peak_anomaly_score,n_bboxes\n')
-            for fn, ps, nb in confidence_log:
-                cf.write(f'{fn},{ps:.6f},{nb}\n')
+            cf.write('filename,peak_anomaly_score,n_bboxes,signal_area_frac,bbox_area_frac,bbox_to_signal_ratio\n')
+            for fn, ps, nb, sf, bf, br in confidence_log:
+                cf.write(f'{fn},{ps:.6f},{nb},{sf:.6f},{bf:.6f},{br:.6f}\n')
 
         return len(file_list), n_with_box, n_no_box, confidence_log
 
     # ── Process training data with train/val split ────────────────────────────
     print("[3/5] Generating bounding boxes for training split…")
     stats = {}
-    for class_name, class_id in CLASSES.items():
-        class_dir = os.path.join(DATA_ROOT, class_name)
-        if not os.path.exists(class_dir):
-            print(f"  Warning: {class_dir} not found. Skipping.")
-            continue
+    with _temporary_param_overrides(param_overrides):
+        for class_name, class_id in CLASSES.items():
+            class_dir = os.path.join(DATA_ROOT, class_name)
+            if not os.path.exists(class_dir):
+                print(f"  Warning: {class_dir} not found. Skipping.")
+                continue
 
-        files = sorted(f for f in os.listdir(class_dir)
-                       if f.lower().endswith(('.png', '.jpg', '.jpeg')))
+            files = sorted(f for f in os.listdir(class_dir)
+                           if f.lower().endswith(('.png', '.jpg', '.jpeg')))
 
-        # Stratified train/val split (deterministic seed)
-        train_files, val_files = train_test_split(
-            files, test_size=VAL_SPLIT_RATIO, random_state=42
-        )
-        print(f"\n  Class '{class_name}' ({class_id}): "
-              f"{len(files)} images → {len(train_files)} train / {len(val_files)} val")
+            # Stratified train/val split (deterministic seed)
+            train_files, val_files = train_test_split(
+                files, test_size=VAL_SPLIT_RATIO, random_state=42
+            )
+            print(f"\n  Class '{class_name}' ({class_id}): "
+                  f"{len(files)} images → {len(train_files)} train / {len(val_files)} val")
 
-        total_t, box_t, nobox_t, _ = _process_split(
-            class_dir, class_name, class_id, 'train', train_files, do_visualise=True
-        )
-        total_v, box_v, nobox_v, _ = _process_split(
-            class_dir, class_name, class_id, 'val', val_files, do_visualise=False
-        )
-        stats[class_name] = {
-            'train': (total_t, box_t, nobox_t),
-            'val':   (total_v, box_v, nobox_v),
-        }
+            total_t, box_t, nobox_t, _ = _process_split(
+                class_dir, class_name, class_id, 'train', train_files, do_visualise=True
+            )
+            total_v, box_v, nobox_v, _ = _process_split(
+                class_dir, class_name, class_id, 'val', val_files, do_visualise=False
+            )
+            stats[class_name] = {
+                'train': (total_t, box_t, nobox_t),
+                'val':   (total_v, box_v, nobox_v),
+            }
 
     # ── Process held-out test data ────────────────────────────────────────────
     print("\n[4/5] Generating bounding boxes for test split…")
-    for class_name, class_id in CLASSES.items():
-        test_dir = os.path.join(TEST_ROOT, class_name)
-        if not os.path.exists(test_dir):
-            print(f"  Warning: {test_dir} not found. Skipping.")
-            continue
+    with _temporary_param_overrides(param_overrides):
+        for class_name, class_id in CLASSES.items():
+            test_dir = os.path.join(TEST_ROOT, class_name)
+            if not os.path.exists(test_dir):
+                print(f"  Warning: {test_dir} not found. Skipping.")
+                continue
 
-        test_files = sorted(f for f in os.listdir(test_dir)
-                            if f.lower().endswith(('.png', '.jpg', '.jpeg')))
-        print(f"\n  Class '{class_name}' (test): {len(test_files)} images")
+            test_files = sorted(f for f in os.listdir(test_dir)
+                                if f.lower().endswith(('.png', '.jpg', '.jpeg')))
+            print(f"\n  Class '{class_name}' (test): {len(test_files)} images")
 
-        total_te, box_te, nobox_te, _ = _process_split(
-            test_dir, class_name, class_id, 'test', test_files, do_visualise=False
-        )
-        if class_name not in stats:
-            stats[class_name] = {}
-        stats[class_name]['test'] = (total_te, box_te, nobox_te)
+            total_te, box_te, nobox_te, _ = _process_split(
+                test_dir, class_name, class_id, 'test', test_files, do_visualise=False
+            )
+            if class_name not in stats:
+                stats[class_name] = {}
+            stats[class_name]['test'] = (total_te, box_te, nobox_te)
 
     # ── Normal-test negative control (G10) ────────────────────────────────────
     # Score the held-out Normal test images through PatchCore. Ideally NONE
     # should produce a localised bbox — any that do indicate the calibration
     # ceiling is too low or Normal variance is too high.
     normal_test_dir = os.path.join(TEST_ROOT, 'Normal')
+    false_pos = 0
+    normal_files = []
     if os.path.isdir(normal_test_dir):
         print("\n[5/5] Normal-test negative control …")
         normal_files = sorted(f for f in os.listdir(normal_test_dir)
@@ -1081,50 +1486,51 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
         normal_vis_dir = os.path.join(nonlocal_vis_dir, 'Normal')
         os.makedirs(normal_vis_dir, exist_ok=True)
 
-        for idx, fname in enumerate(tqdm(normal_files, desc="  Normal/test")):
-            img_path = os.path.join(normal_test_dir, fname)
-            orig_bgr = cv2.imread(img_path)
-            if orig_bgr is None:
-                continue
-            orig_h, orig_w = orig_bgr.shape[:2]
-            orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
+        with _temporary_param_overrides(param_overrides):
+            for idx, fname in enumerate(tqdm(normal_files, desc="  Normal/test")):
+                img_path = os.path.join(normal_test_dir, fname)
+                orig_bgr = cv2.imread(img_path)
+                if orig_bgr is None:
+                    continue
+                orig_h, orig_w = orig_bgr.shape[:2]
+                orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
 
-            amap = compute_anomaly_map(
-                extractor, img_path, nbrs, score_ceiling,
-                transform, device, orig_w, orig_h
-            )
-            bboxes = extract_bboxes(amap, orig_w, orig_h)
-            if bboxes:
-                false_pos += 1
+                amap = compute_anomaly_map(
+                    extractor, img_path, nbrs, score_ceiling,
+                    transform, device, orig_w, orig_h
+                )
+                bboxes = extract_bboxes(amap, orig_w, orig_h)
+                if bboxes:
+                    false_pos += 1
 
-            # Visualise first VISUAL_SAMPLE Normal images (expect blank heatmaps)
-            if idx < VISUAL_SAMPLE:
-                vis_img = orig_rgb.copy()
-                for (xc, yc, bw, bh) in bboxes:
-                    x1 = int((xc - bw / 2) * orig_w)
-                    y1 = int((yc - bh / 2) * orig_h)
-                    x2 = int((xc + bw / 2) * orig_w)
-                    y2 = int((yc + bh / 2) * orig_h)
-                    cv2.rectangle(vis_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                # Visualise first VISUAL_SAMPLE Normal images (expect blank heatmaps)
+                if idx < VISUAL_SAMPLE:
+                    vis_img = orig_rgb.copy()
+                    for (xc, yc, bw, bh) in bboxes:
+                        x1 = int((xc - bw / 2) * orig_w)
+                        y1 = int((yc - bh / 2) * orig_h)
+                        x2 = int((xc + bw / 2) * orig_w)
+                        y2 = int((yc + bh / 2) * orig_h)
+                        cv2.rectangle(vis_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
 
-                fp_label = " [FALSE POSITIVE]" if bboxes else ""
-                peak = float(amap.max()) / 255.0
+                    fp_label = " [FALSE POSITIVE]" if bboxes else ""
+                    peak = float(amap.max()) / 255.0
 
-                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                axes[0].imshow(orig_rgb)
-                axes[0].set_title('Original (Normal)')
-                axes[0].axis('off')
-                axes[1].imshow(amap, cmap='hot')
-                axes[1].set_title(f'Anomaly Map (peak={peak:.3f})')
-                axes[1].axis('off')
-                axes[2].imshow(vis_img)
-                axes[2].set_title(f'BBox Check{fp_label}')
-                axes[2].axis('off')
-                plt.suptitle(f"Normal (negative control) — {fname}", fontsize=10)
-                plt.tight_layout()
-                plt.savefig(os.path.join(normal_vis_dir,
-                            f"normal_{idx+1}_{fname}.png"), dpi=100)
-                plt.close()
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                    axes[0].imshow(orig_rgb)
+                    axes[0].set_title('Original (Normal)')
+                    axes[0].axis('off')
+                    axes[1].imshow(amap, cmap='hot', vmin=0, vmax=255)
+                    axes[1].set_title(f'Anomaly Map (peak={peak:.3f})')
+                    axes[1].axis('off')
+                    axes[2].imshow(vis_img)
+                    axes[2].set_title(f'BBox Check{fp_label}')
+                    axes[2].axis('off')
+                    plt.suptitle(f"Normal (negative control) — {fname}", fontsize=10)
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(normal_vis_dir,
+                                f"normal_{idx+1}_{fname}.png"), dpi=100)
+                    plt.close()
 
         fp_rate = 100 * false_pos / max(len(normal_files), 1)
         print(f"  Normal negative control: {false_pos}/{len(normal_files)} "
@@ -1144,8 +1550,78 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None):
             nb_str = f"  ({no_box} no-box)" if no_box else ""
             print(f"  {cls:12s} {split_name:5s}: {boxed}/{total} localised "
                   f"({pct:.0f}%){nb_str}")
+    quality_metrics = compute_label_quality_metrics(OUTPUT_ROOT)
+    gate = evaluate_quality_gate(quality_metrics,
+                                 min_non_empty_pct=min_non_empty_pct,
+                                 max_edge_box_pct=max_edge_box_pct)
+    quality_report = {
+        'metrics': quality_metrics,
+        'gate': gate,
+    }
+    gate_path = os.path.join(OUTPUT_ROOT, 'quality_gate.json')
+    with open(gate_path, 'w') as gf:
+        json.dump(quality_report, gf, indent=2)
+
     print(f"\n  YOLO dataset   → {OUTPUT_ROOT}")
     print(f"  Visualisations → {nonlocal_vis_dir}")
+    print(f"  Quality gate   → {gate_path}")
+    print(f"  Gate pass      → {gate['overall_pass']}")
+
+    # ── Structured run summaries for reproducibility / failure-mode study ──
+    summary = {
+        'version': _version,
+        'tier': _tier,
+        'backbone': _backbone_label,
+        'calibration_percentile': calibration_percentile,
+        'v11_mode': bool(v11_mode),
+        'v13_mode': bool(v13_mode),
+        'stats': stats,
+        'normal_negative_control': {
+            'false_positives': false_pos,
+            'total': len(normal_files),
+            'fp_rate_pct': (100.0 * false_pos / max(len(normal_files), 1))
+        },
+        'quality_gate': gate,
+        'paths': {
+            'run_dir': run_dir,
+            'yolo_dataset': OUTPUT_ROOT,
+            'visualizations': nonlocal_vis_dir,
+            'quality_gate_json': gate_path,
+        }
+    }
+
+    if run_dir:
+        summary_json = os.path.join(run_dir, 'summary.json')
+        with open(summary_json, 'w', encoding='utf-8') as sf:
+            json.dump(summary, sf, indent=2)
+
+        summary_txt = os.path.join(run_dir, 'summary.txt')
+        with open(summary_txt, 'w', encoding='utf-8') as tf:
+            tf.write(f"version: {_version}\n")
+            tf.write(f"backbone: {_backbone_label}\n")
+            tf.write(f"calibration_percentile: {calibration_percentile}\n")
+            tf.write(f"normal_fp: {false_pos}/{len(normal_files)}\n")
+            tf.write(f"gate_pass: {gate['overall_pass']}\n")
+            tf.write(f"train_non_empty_pass: {gate['train_non_empty_pass']}\n")
+            tf.write(f"edge_box_pass: {gate['edge_box_pass']}\n")
+            tf.write("localisation_summary:\n")
+            for cls, splits in stats.items():
+                for split_name, (total, boxed, no_box) in splits.items():
+                    tf.write(f"  {cls}/{split_name}: {boxed}/{total} boxed, {no_box} no-box\n")
+
+        artifacts = {
+            'confidence_csvs': sorted([
+                os.path.join(OUTPUT_ROOT, x)
+                for x in os.listdir(OUTPUT_ROOT)
+                if x.startswith('confidence_') and x.endswith('.csv')
+            ]),
+            'quality_gate_json': gate_path,
+            'visualizations_dir': nonlocal_vis_dir,
+            'summary_json': summary_json,
+            'summary_txt': summary_txt,
+        }
+        with open(os.path.join(run_dir, 'artifacts_manifest.json'), 'w', encoding='utf-8') as af:
+            json.dump(artifacts, af, indent=2)
 
 if __name__ == "__main__":
     generate_dataset()

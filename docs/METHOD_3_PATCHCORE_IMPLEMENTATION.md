@@ -300,10 +300,10 @@ rebuild required — operates on the runtime excess map only.
 3. **YOLO training lacks prediction visualizations** — hard to assess what
    the detector actually learned without seeing overlay images.
 
-**v7→v8 detection rate comparison:** TBD (v8 not yet run). v7 produced
-identical rates to v6 (Malignant 83%, Benign 80%, NP 82%, Normal FP 53.1%),
-confirming that specular suppression changed bbox *positioning* but not
-detection *rates*.
+**v7→v8 detection rate comparison:** Later runs showed the artifact-suppression
+changes primarily affected specificity/coverage trade-offs rather than providing
+a clean universal improvement. Final quantitative comparisons are tracked in
+`VERSION_REGISTRY.md`.
 
 **Fixes implemented:**
 
@@ -685,7 +685,7 @@ category to provide clear forward options when hitting roadblocks.
 | E2 | **Additional lesion subtypes** — e.g., specific tumor types as subclasses | Finer-grained diagnosis | High (needs data + hierarchical labels) | Not started | After baseline pipeline validated |
 | E3 | **Grounding DINO + MedSAM** — Zero-shot foundation model alternative | Potentially higher bbox precision, no dataset-specific setup | High (external model dependency) | Documented, not pursued | If PatchCore recall proves insufficient on full dataset |
 | E4 | **Multi-modal late fusion** — Combine image features with clinical metadata | Enhanced diagnostic context | High (needs metadata, architecture redesign) | Not started (G15, R4 stretch) | Long-term research goal |
-| E5 | **Public dataset augmentation (Kvasir)** — Add 8,000 pre-labelled endoscopic images | More training data for YOLO | Medium (download, format conversion) | Planned in IMPLEMENTATION_PLAN.md but not executed | If 288 images prove insufficient for YOLO generalisation |
+| E5 | **Public dataset augmentation (Kvasir)** — Add 8,000 pre-labelled endoscopic images | More training data for YOLO | Medium (download, format conversion) | Planned in roadmap docs, not executed | If 288 images prove insufficient for YOLO generalisation |
 
 ### F. Infrastructure
 

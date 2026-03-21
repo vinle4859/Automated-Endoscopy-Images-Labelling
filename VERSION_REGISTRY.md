@@ -1,7 +1,7 @@
 # Version Registry — Endoscopic AI Pipeline
 
 **Project:** Trustworthy Endoscopic AI Pipeline with PatchCore + YOLOv11  
-**Last Updated:** 2026-02-28  
+**Last Updated:** 2026-03-14  
 **Purpose:** Complete record of all pipeline versions, changes, results, and analysis for the failure mode study.
 
 ---
@@ -19,9 +19,12 @@
 | v7 | 1 | Specular suppression | L2+L3 (1536) | 500K | ImageNet | — | — | — | — | — |
 | v8 | 1 | Hair suppression + sessions | L2+L3 (1536) | 500K | ImageNet | 15/32 (47%) | 60/76 (79%) | 59/76 (78%) | 55/76 (72%) | **0.075** |
 | v9 | 2 | Layer 4 features | L2+L3+L4 (3584) | 300K | ImageNet | OOM | OOM | OOM | OOM | OOM |
-| v10 | 3 | DINO backbone | L2+L3+L4 (3584) | 300K | DINO | TBD | TBD | TBD | TBD | TBD |
+| v10 | 3 | DINO backbone | L2+L3+L4 (3584) | 300K | DINO | 0/32* | 1/76 (1%) | 1/76 (1%) | 4/76 (5%) | Train failed (dataset path) |
+| v11 | 3 | ROI-aware glare rejection | L2+L3+L4 (3584) | 300K | ImageNet (selected) | 13/32 (40.6%) | 17/76 (22%) | 23/76 (30%) | 22/76 (29%) | Blocked by gate |
+| v12 | 4 | Auto-calibration + A/B backbone sweep | L2+L3+L4 (3584) | 300K | ImageNet beats DINO | 13/32 (40.6%) | 17/76 (22%) | 23/76 (30%) | 22/76 (29%) | Blocked by gate |
+| v13 | 4 | Soft-border + dual-threshold extraction | L2+L3+L4 (3584) | 300K | ImageNet (selected) | 22/32 (68.8%) | 66/76 (87%) | 70/76 (92%) | 66/76 (87%) | Gate passed (unsafe FP) |
 
-> **Note:** v1–v5 and v7 were development iterations without full YOLO training runs. Results shown are from production runs with complete generate + YOLO evaluation.
+> **Note:** `*` v10 Normal FP is based on the saved negative-control visualizations (all reported `peak=0.000`, no bbox overlays).
 
 ---
 
@@ -32,7 +35,8 @@
 | **Tier 0** | Baseline Development | v1–v6 | Core PatchCore implementation, calibration, scoring, bbox extraction |
 | **Tier 1** | Artifact Suppression | v7–v8 | Pre-processing to remove non-pathological anomaly sources |
 | **Tier 2** | Feature Extraction | v9 | Deeper features (Layer 4), multi-resolution potential |
-| **Tier 3** | Backbone Adaptation | v10 | Domain-adapted backbone via DINO self-supervised learning |
+| **Tier 3** | Backbone Adaptation | v10-v11 | DINO + ROI robustness; v11 recovered from corner-edge collapse but under-targeted lesions |
+| **Tier 4** | Calibration Governance | v12-v13 | Sweep-driven sensitivity + extraction redesign (v13 recovered coverage but exposed gate weakness) |
 
 ---
 
@@ -288,7 +292,8 @@ scikit-learn's `NearestNeighbors(algorithm='brute')` internally copies the bank 
 
 ### v10 — DINO Self-Supervised Backbone (Tier 3)
 
-**Status:** Implemented, awaiting cloud execution  
+**Status:** Executed locally, failed quality gate  
+**Run:** `results/runs/20260311_184717_session/`  
 **Code:** `src/finetune_backbone.py` (DINO training) + `src/generate_bboxes.py` (backbone integration)
 
 **Key Changes:**
@@ -347,7 +352,144 @@ Loss: Cross-entropy(teacher_sharpened, student_softened)
 3. **Better specular invariance:** Augmentations during DINO training (color jitter, blur, crop) teach the backbone to ignore specular reflections → reduces Normal FPs without explicit masking
 4. **NP improvement:** The tighter Normal cluster should make the subtle structural differences of NP more detectable
 
-**Requires:** GPU with ≥8 GB VRAM for DINO training, ≥32 GB RAM for PatchCore bank
+**Observed outcomes (2026-03-11 run):**
+
+| Metric | Value |
+|---|---|
+| Train labels with bbox | 6 / 228 (2.6%) |
+| Val labels with bbox | 1 / 60 (1.7%) |
+| Test labels with bbox | 3 / 96 (3.1%) |
+| Edge-centered boxes (train) | 6 / 6 (100%) |
+| Mean peak anomaly (train Benign/Malignant/NP) | 0.0015 / 0.0028 / 0.0047 |
+
+**Failure analysis:**
+- The anomaly map is near-zero for almost all lesion images and activates mostly on corner glare/border artifacts.
+- Label sparsity is too severe for YOLO supervision (only 2.6% of train samples have any box).
+- YOLO did not start because `configs/yolo_data.yaml` used `path: ../data/yolo_dataset`, which resolves outside the repo when run from project root.
+- Fix applied on 2026-03-12: `configs/yolo_data.yaml` now uses `path: data/yolo_dataset`.
+
+**Decision:**
+- v10 is retained as a research checkpoint but **rejected for training** until detection coverage and spatial quality recover.
+
+---
+
+### v11 — ROI-Aware Glare Rejection (Tier 3)
+
+**Status:** Evaluated (2026-03-13)  
+**Run:** `results/runs/20260313_112259_generate/`
+
+**Implemented changes:**
+1. Endoscope field-of-view masking at feature-map level (`ENABLE_FOV_MASK=true`).
+2. Border-connected component rejection (`BORDER_REJECT_MARGIN=4`).
+3. Sensitivity from sweep-selected config (ImageNet):
+   `calibration_percentile=99`, `ANOMALY_MARGIN_FRAC=0.08`, `ANOMALY_FLOOR_THRESH=0.03`.
+
+**Observed outcomes:**
+- Malignant train: 17/76 (22%)
+- Benign train: 23/76 (30%)
+- NP train: 22/76 (29%)
+- Normal FP: 13/32 (40.6%)
+- Train non-empty labels: 62/228 (27.2%)
+- Edge-centered boxes: 0%
+- Quality gate: **FAIL** (coverage below 30% threshold)
+
+**Interpretation:**
+- v11 successfully removed corner/edge artifacts (edge-box rate 0%).
+- But lesion recall remained low and Normal FP remained high.
+- This indicates the pipeline moved from "edge-glare dominated" to
+  "under-targeted but still nonspecific" behavior.
+
+---
+
+### v12 — Auto-Calibration Quality Gate (Tier 4)
+
+**Status:** Evaluated (2026-03-13)
+
+**Implemented changes:**
+1. Grid sweep over (`calibration_percentile`, `margin`, `floor`).
+2. Objective function using abnormal coverage, normal FP, and edge-box penalty.
+3. YOLO auto-block when generated labels fail quality thresholds.
+4. Backbone A/B sweep (ImageNet vs DINO), selecting better objective.
+
+**Observed outcomes:**
+- ImageNet sweep best objective: 13.021 at (99, 0.08, 0.03)
+- DINO sweep collapsed to all-zero objective under tested grid
+  (all configs reported 0 abnormal coverage in sample sweep)
+- Final selected backbone: ImageNet
+- Final generation still failed quality gate (`overall_pass=false`)
+
+**Important note:**
+- `results/v11_sweeps/latest_sweep.json` is overwritten by the final backbone
+  pass during v12 A/B. If DINO is swept second, the file may not reflect the
+  actually selected global winner. The run log remains the source of truth.
+
+---
+
+### Root-Cause Analysis (v11-v12)
+
+**Why false positives are still high (40.6% Normal FP):**
+1. Historical pattern persists from older versions: specular/mucus/instrument
+   patterns remain farther from the Normal bank than some true lesions.
+2. Lowering margin to recover lesions increases diffuse internal false detections.
+3. Current sweep objective still permits a high Normal FP if abnormal coverage improves.
+
+**Why anomaly maps show signal but bboxes are not emitted:**
+1. Signal is often present (`peak_anomaly_score >= 0.05`) but fragmented.
+2. Border rejection at feature-map margin 4 (on 32x32) removes many near-wall
+   connected components before bbox creation.
+3. Area/morphology constraints filter weak/small components after thresholding,
+   producing many `signal-but-no-box` outcomes.
+
+**Evidence from confidence logs (latest run):**
+- Train Malignant: 71 images with peak >= 0.05, but only 17 boxed.
+- Train Benign: 67 images with peak >= 0.05, but only 23 boxed.
+- Train NP: 72 images with peak >= 0.05, but only 22 boxed.
+
+---
+
+### v13 — Soft-Border + Dual-Threshold Extraction (Tier 4)
+
+**Status:** Evaluated and replicated (2026-03-13 and 2026-03-14)  
+**Run A:** `results/runs/20260313_161640_generate/`  
+**Log A:** `results/logs/v13_advanced_20260313_154100.log`  
+**Run B:** `results/runs/20260314_171000_generate/`  
+**Log B:** `results/logs/v13_advanced_20260314_163000.log`
+
+**Implemented changes:**
+1. Soft border attenuation at feature-map score level (replacing hard border component rejection).
+2. Dual-threshold seed-grow extraction (`high` seed + `low` grow mask).
+3. Structured run outputs for failure-mode tracking:
+   `run_info.txt`, `summary.json`, `summary.txt`, `artifacts_manifest.json`.
+4. Confidence CSVs now include `signal_area_frac`, `bbox_area_frac`, `bbox_to_signal_ratio`.
+
+**Observed outcomes:**
+- Malignant train: 66/76 (87%)
+- Benign train: 70/76 (92%)
+- NP train: 66/76 (87%)
+- Train non-empty labels: 202/228 (88.6%)
+- Normal FP: 22/32 (68.8%)
+- Edge-box rate: 9.42% overall
+- Quality gate: **PASS** (`overall_pass=true`)
+
+**Replication note:**
+- The 2026-03-14 run is an independent repeat execution that reproduces the
+  same key v13 outcome profile from 2026-03-13 (high abnormal coverage,
+  high Normal FP, gate pass under current criteria).
+
+**Interpretation:**
+- v13 solved the low-coverage failure mode from v11/v12.
+- However, specificity collapsed on held-out Normal controls.
+- This is a governance failure mode: the current gate can pass while clinically
+  risky false positives remain high.
+
+**Box-vs-signal size diagnostics (v13):**
+- Mean `bbox_to_signal_ratio` across confidence CSVs is ~1.31-1.52.
+- Bboxes are moderately larger than heatmap support (expected from dilation,
+  padding, and merging), but not catastrophically inflated in this run.
+
+**v13 decision:**
+- **Do not treat gate pass as approval for trusted YOLO training** until the
+  gate includes Normal negative-control constraints.
 
 ---
 
@@ -357,30 +499,30 @@ When cloud results are available, update this section:
 
 ### Detection Rate Comparison
 
-| Class | v6 (Baseline) | v8 (Tier 1) | v9 (Tier 2) | v10 (Tier 3) |
-|-------|---------------|-------------|-------------|-------------- |
-| Malignant | 63/76 (83%) | 60/76 (79%) | TBD | TBD |
-| Benign | 61/76 (80%) | 59/76 (78%) | TBD | TBD |
-| NP | 62/76 (82%) | 55/76 (72%) | TBD | TBD |
-| Normal FP | 17/32 (53%) | 15/32 (47%) | TBD | TBD |
+| Class | v6 (Baseline) | v8 (Tier 1) | v10 (DINO) | v11/v12 (ImageNet+ROI+sweep) | v13 (soft-border + dual-threshold) |
+|-------|---------------|-------------|------------|-------------------------------|-------------------------------------|
+| Malignant | 63/76 (83%) | 60/76 (79%) | 1/76 (1%) | 17/76 (22%) | 66/76 (87%) |
+| Benign | 61/76 (80%) | 59/76 (78%) | 1/76 (1%) | 23/76 (30%) | 70/76 (92%) |
+| NP | 62/76 (82%) | 55/76 (72%) | 4/76 (5%) | 22/76 (29%) | 66/76 (87%) |
+| Normal FP | 17/32 (53%) | 15/32 (47%) | 0/32* | 13/32 (40.6%) | 22/32 (68.8%) |
 
 ### YOLO Performance Comparison
 
-| Metric | v6 | v8 | v9 | v10 |
+| Metric | v6 | v8 | v10 | v11/v12 | v13 |
 |--------|-----|-----|-----|------|
-| mAP50 | 0.181 | 0.075 | TBD | TBD |
-| mAP50-95 | 0.045 | TBD | TBD | TBD |
-| Malignant AP | — | — | TBD | TBD |
-| Benign AP | — | — | TBD | TBD |
-| NP AP | — | — | TBD | TBD |
+| mAP50 | 0.181 | 0.075 | Train failed (dataset path) | Blocked by label gate |
+| mAP50-95 | 0.045 | TBD | TBD | Blocked by label gate | Not run (gate criteria under revision) |
+| Malignant AP | — | — | TBD | Blocked by label gate | Not run |
+| Benign AP | — | — | TBD | Blocked by label gate | Not run |
+| NP AP | — | — | TBD | Blocked by label gate | Not run |
 
 ### Key Questions to Answer
 
-1. **Does Layer 4 help NP detection?** v9 vs v6/v8 NP detection rate
-2. **Does DINO close the domain gap?** v10 Normal FP rate vs v6/v8
-3. **Does DINO improve YOLO end-to-end?** v10 mAP50 vs all others
-4. **Is the v8 regression recoverable?** v9/v10 should surpass v6 if the hypothesis is correct
-5. **What is the calibration ceiling shift?** DINO backbone should produce lower Normal ceilings if the cluster is tighter
+1. **Can gate design include Normal-control constraints (e.g., Normal FP <= 20%)?**
+2. **What objective weights avoid selecting high-recall/high-FP configurations?**
+3. **Can per-class thresholds reduce NP/Benign collapse without increasing Normal FP?**
+4. **Should v14 move to hybrid proposal+segmentation (Med-SAM) for refinement?**
+5. **Can uncertainty-aware filtering remove low-trust pseudo-labels before YOLO?**
 
 ---
 
@@ -388,11 +530,11 @@ When cloud results are available, update this section:
 
 | File | Purpose | Version |
 |------|---------|---------|
-| `src/generate_bboxes.py` | Core PatchCore + bbox pipeline | v10 (supports `backbone_path`) |
+| `src/generate_bboxes.py` | Core PatchCore + bbox pipeline | v13 (soft-border, dual-threshold, structured summaries) |
 | `src/finetune_backbone.py` | DINO self-supervised fine-tuning | v10 (new) |
-| `src/main.py` | CLI entry point | v10 (supports `--step finetune`, `--backbone`) |
-| `src/train_yolo.py` | YOLOv11 training | v8 (session support) |
-| `src/run_manager.py` | Timestamped run directories | v8 (session grouping) |
+| `src/main.py` | CLI entry point | v13 (`--v12-advanced` running v13 extraction stack) |
+| `src/train_yolo.py` | YOLOv11 training | v12 (automatic bad-label block) |
+| `src/run_manager.py` | Timestamped run directories | v13 (run_info.txt + latest JSON + by-version pointers) |
 | `run_cloud.py` | Cloud orchestration script | v10 (new) |
 | `models/patchcore_bank.npz` | ImageNet backbone bank cache | v9 |
 | `models/patchcore_bank_dino.npz` | DINO backbone bank cache | v10 (created on cloud) |
@@ -461,9 +603,9 @@ cd src && python main.py --step all --backbone dino
 
 | Priority | Item | Tier | Status |
 |----------|------|------|--------|
-| 1 | v9 evaluation (Layer 4 features) | 2 | Code ready, needs cloud |
-| 2 | v10 evaluation (DINO backbone) | 3 | Code ready, needs cloud |
-| 3 | Multi-resolution ensembling | 2 | Not started |
-| 4 | Two-stage detect & classify (EfficientNet) | 3 | Documented, not started |
-| 5 | FAISS GPU-accelerated k-NN | 2 | Not started |
-| 6 | Noise-aware YOLO training | 3 | Not started |
+| 1 | Gate v2: add Normal FP and confidence-calibrated precision constraints | 4 | Next |
+| 2 | Per-class gate metrics and weighted objective redefinition | 4 | Next |
+| 3 | v14 hybrid PatchCore proposal + Med-SAM refinement | 5 | Planned |
+| 4 | Uncertainty-aware pseudo-label filtering before YOLO | 5 | Planned |
+| 5 | Two-stage detect & classify (EfficientNet) | 5 | Documented, not started |
+| 6 | FAISS GPU-accelerated k-NN | 2 | Not started |

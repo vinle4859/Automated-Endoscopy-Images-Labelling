@@ -3,7 +3,7 @@
 **Project:** Trustworthy Endoscopic AI with YOLOv11
 **Status:** Fully implemented and trained. **Abandoned** â€” fundamental failure mode identified
 during evaluation. Superseded by Method 3 (PatchCore).
-**Code preserved in:** `src/model.py`, `src/train_autoencoder.py`, `models/autoencoder_best.pth`
+**Code artifact status:** Historical Method 2 implementation files are not retained in this workspace snapshot.
 
 ---
 
@@ -108,15 +108,5 @@ and represents a genuine lesson for this project.
 | Resolution | Method 3 (PatchCore): feature-space distance, no training required |
 
 ---
-
-## Preserved Artefacts
-
-| File | Description |
-|---|---|
-| `src/model.py` | `UNetAutoencoder` and `DoubleConv` class definitions |
-| `src/train_autoencoder.py` | Training loop with loss plotting |
-| `src/dataset.py` | `EndoscopicDataset`, `SubsetWithTransform`, `get_transforms()` |
-| `models/autoencoder_best.pth` | Trained weights (kept for reference / future experiments) |
-
 
 ---

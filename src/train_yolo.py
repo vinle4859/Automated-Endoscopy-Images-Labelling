@@ -53,6 +53,8 @@ DEFAULT_IMGSZ   = 640
 DEFAULT_EPOCHS  = 75
 DEFAULT_BATCH   = 16
 DEFAULT_PATIENCE = 10
+MIN_NON_EMPTY_PCT = 30.0
+MAX_EDGE_BOX_PCT = 20.0
 
 
 def parse_args():
@@ -63,11 +65,69 @@ def parse_args():
     p.add_argument('--batch',    type=int, default=DEFAULT_BATCH)
     p.add_argument('--patience', type=int, default=DEFAULT_PATIENCE)
     p.add_argument('--resume',   action='store_true', help='Resume from last.pt')
+    p.add_argument('--force-bad-labels', action='store_true',
+                   help='Bypass quality gate and force training even with bad labels.')
     return p.parse_args()
+
+
+def _check_label_quality_gate():
+    """Read generated labels and enforce no-go gate for resource savings."""
+    yolo_root = os.path.join(PROJECT_ROOT, 'data', 'yolo_dataset', 'labels')
+    splits = ['train', 'val', 'test']
+    total_boxes = 0
+    total_edge = 0
+    train_non_empty_pct = 0.0
+
+    for split in splits:
+        lbl_dir = os.path.join(yolo_root, split)
+        if not os.path.isdir(lbl_dir):
+            continue
+        txts = [f for f in os.listdir(lbl_dir) if f.endswith('.txt')]
+        non_empty = 0
+        boxes = 0
+        edge = 0
+        for fn in txts:
+            content = open(os.path.join(lbl_dir, fn)).read().strip()
+            if content:
+                non_empty += 1
+            for line in content.splitlines():
+                s = line.split()
+                if len(s) >= 5:
+                    boxes += 1
+                    xc = float(s[1]); yc = float(s[2])
+                    if xc < 0.2 or xc > 0.8 or yc < 0.2 or yc > 0.8:
+                        edge += 1
+        if split == 'train':
+            train_non_empty_pct = 100.0 * non_empty / max(len(txts), 1)
+        total_boxes += boxes
+        total_edge += edge
+
+    overall_edge_pct = 100.0 * total_edge / max(total_boxes, 1)
+    passed = (train_non_empty_pct >= MIN_NON_EMPTY_PCT and
+              overall_edge_pct <= MAX_EDGE_BOX_PCT)
+    return {
+        'passed': passed,
+        'train_non_empty_pct': train_non_empty_pct,
+        'overall_edge_box_pct': overall_edge_pct,
+        'thresholds': {
+            'min_non_empty_pct': MIN_NON_EMPTY_PCT,
+            'max_edge_box_pct': MAX_EDGE_BOX_PCT,
+        }
+    }
 
 
 def main(session=None):
     args = parse_args()
+
+    gate = _check_label_quality_gate()
+    if not gate['passed'] and not args.force_bad_labels:
+      print("ERROR: Label quality gate failed. Blocking YOLO training to save resources.")
+      print(f"  Train non-empty labels: {gate['train_non_empty_pct']:.2f}% "
+          f"(min {gate['thresholds']['min_non_empty_pct']}%)")
+      print(f"  Edge-centered boxes: {gate['overall_edge_box_pct']:.2f}% "
+          f"(max {gate['thresholds']['max_edge_box_pct']}%)")
+      print("  Regenerate labels with improved v11/v12 settings before training.")
+      sys.exit(1)
 
     # Validate dataset exists
     yolo_img_train = os.path.join(

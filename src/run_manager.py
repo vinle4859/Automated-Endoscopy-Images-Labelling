@@ -145,11 +145,39 @@ def create_run_dir(step_name: str, *,
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
+    # Write a concise human-readable companion file for quick inspection.
+    info_txt = os.path.join(run_dir, 'run_info.txt')
+    with open(info_txt, 'w', encoding='utf-8') as f:
+        f.write(f"timestamp: {meta['timestamp']}\n")
+        f.write(f"step: {step_name}\n")
+        f.write(f"version: {version}\n")
+        f.write(f"run_dir: {run_dir}\n")
+        if session is not None:
+            f.write(f"session_dir: {session.session_dir}\n")
+        if params:
+            f.write("params:\n")
+            for k, v in sorted(params.items()):
+                f.write(f"  {k}: {v}\n")
+
     # Update "latest" pointer for this step
     os.makedirs(RUNS_DIR, exist_ok=True)
     latest_path = os.path.join(RUNS_DIR, f'latest_{step_name}.txt')
     with open(latest_path, 'w', encoding='utf-8') as f:
-        f.write(run_dir)
+        f.write(run_dir + "\n")
+
+    latest_json_path = os.path.join(RUNS_DIR, f'latest_{step_name}.json')
+    with open(latest_json_path, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    # Maintain version-scoped pointers for failure-mode studies.
+    by_ver_dir = os.path.join(RUNS_DIR, 'by_version', version)
+    os.makedirs(by_ver_dir, exist_ok=True)
+    by_ver_latest_txt = os.path.join(by_ver_dir, f'latest_{step_name}.txt')
+    with open(by_ver_latest_txt, 'w', encoding='utf-8') as f:
+        f.write(run_dir + "\n")
+    by_ver_latest_json = os.path.join(by_ver_dir, f'latest_{step_name}.json')
+    with open(by_ver_latest_json, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
 
     # Record in session if applicable
     if session is not None:

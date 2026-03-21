@@ -6,7 +6,7 @@
 
 A fully automated annotation pipeline that generates bounding-box labels for endoscopic images **without any manual annotation**. The system uses [PatchCore](https://arxiv.org/abs/2106.08265) anomaly detection with a ResNet50 backbone to localise pathological regions, then trains a [YOLOv11](https://docs.ultralytics.com/) object detector on the auto-generated labels.
 
-> **Status:** v10 (DINO self-supervised backbone) implemented, awaiting GPU cloud evaluation.
+> **Status:** v13 advanced run completed (2026-03-14). Soft-border + dual-threshold extraction dramatically increased lesion coverage and passed the current gate, but Normal negative-control FP rose to 68.8% (22/32), making the gate criteria insufficient for trustworthy progression.
 
 ---
 
@@ -14,7 +14,7 @@ A fully automated annotation pipeline that generates bounding-box labels for end
 
 - **Zero Manual Annotation** — PatchCore anomaly detection generates YOLO bounding boxes from image-level class labels alone
 - **Domain-Adapted Backbone** — Optional DINO self-supervised fine-tuning adapts ResNet50 features to endoscopic tissue (v10)
-- **Multi-Tier Architecture** — 10 iterative versions across 4 tiers: baseline → artifact suppression → deeper features → backbone adaptation
+- **Multi-Tier Architecture** — 13 iterative versions across 5 tiers: baseline → artifact suppression → deeper features → backbone adaptation → calibration governance
 - **Built-in Explainability** — Anomaly heatmap overlays and diagnostic visualisations show why each region was flagged
 - **Reproducible** — Fixed seeds, cached memory banks, timestamped run directories
 
@@ -103,24 +103,28 @@ Automated-Endoscopy-Images-Labelling/
 ├── data/                       # Datasets (git-ignored, see below)
 ├── models/                     # Weights and feature banks (git-ignored)
 ├── results/                    # Training outputs (git-ignored)
-├── VERSION_REGISTRY.md         # Complete version history (v1–v10)
+├── VERSION_REGISTRY.md         # Complete version history (v1–v13)
 ├── requirements.txt
 └── LICENSE
 ```
 
 ## Version History
 
-The pipeline evolved through 10 versions across 4 tiers. See [VERSION_REGISTRY.md](VERSION_REGISTRY.md) for the complete record with parameters, results, and failure analysis.
+The pipeline evolved through 13 versions across 5 tiers. See [VERSION_REGISTRY.md](VERSION_REGISTRY.md) for the complete record with parameters, results, and failure analysis.
 
 | Version | Tier | Key Change | YOLO mAP50 | Status |
 |---------|------|------------|------------|--------|
-| v1–v5 | 0 | Core PatchCore development | — | Superseded |
+| v1-v5 | 0 | Core PatchCore development | — | Superseded |
 | v6 | 0 | Bbox merging + adaptive threshold | **0.181** | Baseline |
-| v7–v8 | 1 | Specular + hair suppression | 0.075 | Evaluated |
+| v7-v8 | 1 | Specular + hair suppression | 0.075 | Evaluated |
 | v9 | 2 | Layer 4 features (3584-dim) | OOM | Needs ≥32 GB RAM |
-| v10 | 3 | DINO self-supervised backbone | TBD | Awaiting cloud |
+| v10 | 3 | DINO self-supervised backbone | Train failed | Local run showed near-zero lesion coverage |
+| v11 | 3 | ROI-aware glare rejection | Blocked by gate | Edge artifacts removed, lesion coverage still low |
+| v12 | 4 | Auto-calibration + backbone A/B | Blocked by gate | ImageNet selected; gate still fails (coverage/FP trade-off) |
+| v13 | 4 | Soft-border + dual-threshold extraction | Gate passed, clinically risky | 88.6% train non-empty labels but 68.8% Normal FP |
+| v14 | 5 | Hybrid PatchCore + Med-SAM refinement | Planned | Improve localization while controlling false positives |
 
-**Key finding:** Artifact suppression (Tier 1) reached diminishing returns — further masking hurt true anomaly signal more than it helped specificity. The path forward is better features via deeper layers (Tier 2) and domain-adapted backbones (Tier 3).
+**Current finding:** v13 fixed under-coverage but over-expanded detections into Normal space. The pipeline now has a gate-design failure mode: it can pass quality checks while still generating high Normal false positives. Next iterations must tighten gate definitions (include Normal FP constraints) before any trusted YOLO retraining.
 
 ## Documentation
 
@@ -132,6 +136,9 @@ The pipeline evolved through 10 versions across 4 tiers. See [VERSION_REGISTRY.m
 | [AUTOMATED_ANNOTATION_STRATEGIES.md](docs/AUTOMATED_ANNOTATION_STRATEGIES.md) | Methodology evolution narrative |
 | [METHOD_2_UNET_AUTOENCODER.md](docs/METHOD_2_UNET_AUTOENCODER.md) | Failed U-Net approach (negative result) |
 | [BBOX_MERGE_VS_SPLIT.md](docs/BBOX_MERGE_VS_SPLIT.md) | Bbox merging design decisions |
+| [FAILURE_MODE_STUDY_READINESS.md](docs/FAILURE_MODE_STUDY_READINESS.md) | Paper-readiness checklist for failure-mode study artifacts |
+| [PUBLICATION_STRATEGY.md](docs/PUBLICATION_STRATEGY.md) | Venue-tier strategy and evidence quality targets |
+| [NEXT_STEPS_PRIORITIZATION.md](docs/NEXT_STEPS_PRIORITIZATION.md) | Ranked execution plan for post-v13 work |
 
 ## Data Privacy
 
