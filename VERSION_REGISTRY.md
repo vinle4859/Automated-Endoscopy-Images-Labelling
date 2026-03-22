@@ -1,7 +1,7 @@
 # Version Registry — Endoscopic AI Pipeline
 
 **Project:** Trustworthy Endoscopic AI Pipeline with PatchCore + YOLOv11  
-**Last Updated:** 2026-03-14  
+**Last Updated:** 2026-03-22  
 **Purpose:** Complete record of all pipeline versions, changes, results, and analysis for the failure mode study.
 
 ---
@@ -23,6 +23,8 @@
 | v11 | 3 | ROI-aware glare rejection | L2+L3+L4 (3584) | 300K | ImageNet (selected) | 13/32 (40.6%) | 17/76 (22%) | 23/76 (30%) | 22/76 (29%) | Blocked by gate |
 | v12 | 4 | Auto-calibration + A/B backbone sweep | L2+L3+L4 (3584) | 300K | ImageNet beats DINO | 13/32 (40.6%) | 17/76 (22%) | 23/76 (30%) | 22/76 (29%) | Blocked by gate |
 | v13 | 4 | Soft-border + dual-threshold extraction | L2+L3+L4 (3584) | 300K | ImageNet (selected) | 22/32 (68.8%) | 66/76 (87%) | 70/76 (92%) | 66/76 (87%) | Gate passed (unsafe FP) |
+| v14 | 5 | Hybrid PatchCore + Med-SAM refinement | L2+L3+L4 (+refinement) | 300K | ImageNet/DINO | Planned | Planned | Planned | Planned | Planned |
+| v15 (draft) | 5 | Gate-v2 governance on v13 extraction | L2+L3+L4 (3584) | 300K | ImageNet/DINO | Pending | Pending | Pending | Pending | Gate-v2 constraints enabled |
 
 > **Note:** `*` v10 Normal FP is based on the saved negative-control visualizations (all reported `peak=0.000`, no bbox overlays).
 

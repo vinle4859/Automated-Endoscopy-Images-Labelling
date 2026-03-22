@@ -204,6 +204,12 @@ ENABLE_V13_DUAL_THRESH = True
 DUAL_THRESH_LOW_RATIO  = 0.55   # low threshold = high_threshold * ratio
 DUAL_THRESH_LOW_FLOOR  = 0.015  # absolute floor for grow mask
 
+# ── v15 draft gate-v2 constraints ───────────────────────────────────────────
+# Governance-focused draft constraints to avoid accepting high-coverage
+# pseudo-label sets that collapse specificity on Normal controls.
+V15_MAX_NORMAL_FP_PCT = 20.0
+V15_MAX_BBOX_TO_SIGNAL_RATIO = 1.80
+
 # ImageNet normalisation required for pretrained ResNet weights
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -859,7 +865,10 @@ def extract_bboxes(amap, orig_w, orig_h, param_overrides=None):
         return bboxes
 
 
-def compute_label_quality_metrics(output_root=OUTPUT_ROOT):
+def compute_label_quality_metrics(output_root=OUTPUT_ROOT,
+                                  normal_false_pos=0,
+                                  normal_total=0,
+                                  confidence_logs=None):
     """Compute gate metrics from generated YOLO label files."""
     metrics = {}
     total_boxes = 0
@@ -892,26 +901,70 @@ def compute_label_quality_metrics(output_root=OUTPUT_ROOT):
             'boxes': boxes,
             'edge_box_pct': (100.0 * edge / max(boxes, 1)),
         }
+    bbox_to_signal_vals = []
+    if confidence_logs:
+        for logs in confidence_logs:
+            for row in logs:
+                # row format: (filename, peak, n_bboxes, signal_frac,
+                #              bbox_frac, bbox_to_signal_ratio)
+                if len(row) >= 6:
+                    bbox_to_signal_vals.append(float(row[5]))
+
     metrics['overall'] = {
         'boxes': total_boxes,
         'edge_box_pct': (100.0 * total_edge / max(total_boxes, 1)),
+        'mean_bbox_to_signal_ratio': (
+            float(np.mean(bbox_to_signal_vals)) if bbox_to_signal_vals else 0.0
+        ),
+        'p95_bbox_to_signal_ratio': (
+            float(np.percentile(bbox_to_signal_vals, 95)) if bbox_to_signal_vals else 0.0
+        ),
+    }
+    metrics['normal_negative_control'] = {
+        'false_positives': int(normal_false_pos),
+        'total': int(normal_total),
+        'fp_pct': (100.0 * float(normal_false_pos) / max(int(normal_total), 1)),
     }
     return metrics
 
 
 def evaluate_quality_gate(metrics, min_non_empty_pct=30.0,
-                          max_edge_box_pct=20.0):
+                          max_edge_box_pct=20.0,
+                          max_normal_fp_pct=None,
+                          max_bbox_to_signal_ratio=None):
     """Return pass/fail booleans for resource-saving YOLO blocking."""
     train_pct = metrics.get('train', {}).get('non_empty_pct', 0.0)
     edge_pct = metrics.get('overall', {}).get('edge_box_pct', 100.0)
+    normal_fp_pct = metrics.get('normal_negative_control', {}).get('fp_pct', 100.0)
+    mean_bbox_to_signal = metrics.get('overall', {}).get('mean_bbox_to_signal_ratio', 999.0)
+
+    normal_fp_pass = True
+    if max_normal_fp_pct is not None:
+        normal_fp_pass = normal_fp_pct <= max_normal_fp_pct
+
+    bbox_signal_pass = True
+    if max_bbox_to_signal_ratio is not None:
+        bbox_signal_pass = mean_bbox_to_signal <= max_bbox_to_signal_ratio
+
+    overall_pass = (train_pct >= min_non_empty_pct and
+                    edge_pct <= max_edge_box_pct and
+                    normal_fp_pass and
+                    bbox_signal_pass)
+
     return {
         'train_non_empty_pass': train_pct >= min_non_empty_pct,
         'edge_box_pass': edge_pct <= max_edge_box_pct,
-        'overall_pass': (train_pct >= min_non_empty_pct and
-                         edge_pct <= max_edge_box_pct),
+        'normal_fp_pass': normal_fp_pass,
+        'bbox_to_signal_pass': bbox_signal_pass,
+        'overall_pass': overall_pass,
+        'mode': 'gate_v2' if (max_normal_fp_pct is not None or
+                              max_bbox_to_signal_ratio is not None)
+                else 'gate_v1',
         'thresholds': {
             'min_non_empty_pct': min_non_empty_pct,
             'max_edge_box_pct': max_edge_box_pct,
+            'max_normal_fp_pct': max_normal_fp_pct,
+            'max_mean_bbox_to_signal_ratio': max_bbox_to_signal_ratio,
         }
     }
 
@@ -1125,7 +1178,10 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
                      anom_floor=None, anom_margin=None,
                      calibration_percentile=99, v11_mode=True,
                      v13_mode=True,
-                     min_non_empty_pct=30.0, max_edge_box_pct=20.0):
+                     v15_mode=False,
+                     min_non_empty_pct=30.0, max_edge_box_pct=20.0,
+                     max_normal_fp_pct=None,
+                     max_bbox_to_signal_ratio=None):
     """
     PatchCore-based pipeline:
     1. Load cached Normal memory bank, or build + cache it if absent / forced.
@@ -1173,11 +1229,11 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
 
     # ── Determine version and tier based on backbone selection ───────────────
     if backbone_path is not None:
-        _version = 'v13' if v13_mode else ('v11' if v11_mode else 'v10')
+        _version = 'v15' if v15_mode else ('v13' if v13_mode else ('v11' if v11_mode else 'v10'))
         _tier = 'Tier3_DINO'
         _backbone_label = f'DINO ({os.path.basename(backbone_path)})'
     else:
-        _version = 'v13' if v13_mode else ('v11' if v11_mode else 'v9')
+        _version = 'v15' if v15_mode else ('v13' if v13_mode else ('v11' if v11_mode else 'v9'))
         _tier = 'Tier2_Layer4'
         _backbone_label = 'ImageNet (default)'
 
@@ -1215,6 +1271,9 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
             'ENABLE_FOV_MASK': bool(v11_mode),
             'ENABLE_V13_SOFT_BORDER': bool(v13_mode),
             'ENABLE_V13_DUAL_THRESH': bool(v13_mode),
+            'ENABLE_V15_DRAFT': bool(v15_mode),
+            'V15_MAX_NORMAL_FP_PCT': max_normal_fp_pct,
+            'V15_MAX_MEAN_BBOX_TO_SIGNAL_RATIO': max_bbox_to_signal_ratio,
         }, session=session)
         vis_dir_root = os.path.join(run_dir, 'visualizations')
     except ImportError:
@@ -1420,6 +1479,7 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
     # ── Process training data with train/val split ────────────────────────────
     print("[3/5] Generating bounding boxes for training split…")
     stats = {}
+    all_confidence_logs = []
     with _temporary_param_overrides(param_overrides):
         for class_name, class_id in CLASSES.items():
             class_dir = os.path.join(DATA_ROOT, class_name)
@@ -1437,12 +1497,13 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
             print(f"\n  Class '{class_name}' ({class_id}): "
                   f"{len(files)} images → {len(train_files)} train / {len(val_files)} val")
 
-            total_t, box_t, nobox_t, _ = _process_split(
+            total_t, box_t, nobox_t, conf_t = _process_split(
                 class_dir, class_name, class_id, 'train', train_files, do_visualise=True
             )
-            total_v, box_v, nobox_v, _ = _process_split(
+            total_v, box_v, nobox_v, conf_v = _process_split(
                 class_dir, class_name, class_id, 'val', val_files, do_visualise=False
             )
+            all_confidence_logs.extend([conf_t, conf_v])
             stats[class_name] = {
                 'train': (total_t, box_t, nobox_t),
                 'val':   (total_v, box_v, nobox_v),
@@ -1461,9 +1522,10 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
                                 if f.lower().endswith(('.png', '.jpg', '.jpeg')))
             print(f"\n  Class '{class_name}' (test): {len(test_files)} images")
 
-            total_te, box_te, nobox_te, _ = _process_split(
+            total_te, box_te, nobox_te, conf_te = _process_split(
                 test_dir, class_name, class_id, 'test', test_files, do_visualise=False
             )
+            all_confidence_logs.append(conf_te)
             if class_name not in stats:
                 stats[class_name] = {}
             stats[class_name]['test'] = (total_te, box_te, nobox_te)
@@ -1550,10 +1612,17 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
             nb_str = f"  ({no_box} no-box)" if no_box else ""
             print(f"  {cls:12s} {split_name:5s}: {boxed}/{total} localised "
                   f"({pct:.0f}%){nb_str}")
-    quality_metrics = compute_label_quality_metrics(OUTPUT_ROOT)
+    quality_metrics = compute_label_quality_metrics(
+        OUTPUT_ROOT,
+        normal_false_pos=false_pos,
+        normal_total=len(normal_files),
+        confidence_logs=all_confidence_logs,
+    )
     gate = evaluate_quality_gate(quality_metrics,
                                  min_non_empty_pct=min_non_empty_pct,
-                                 max_edge_box_pct=max_edge_box_pct)
+                                 max_edge_box_pct=max_edge_box_pct,
+                                 max_normal_fp_pct=max_normal_fp_pct,
+                                 max_bbox_to_signal_ratio=max_bbox_to_signal_ratio)
     quality_report = {
         'metrics': quality_metrics,
         'gate': gate,
@@ -1575,6 +1644,7 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
         'calibration_percentile': calibration_percentile,
         'v11_mode': bool(v11_mode),
         'v13_mode': bool(v13_mode),
+        'v15_mode': bool(v15_mode),
         'stats': stats,
         'normal_negative_control': {
             'false_positives': false_pos,
@@ -1602,8 +1672,11 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
             tf.write(f"calibration_percentile: {calibration_percentile}\n")
             tf.write(f"normal_fp: {false_pos}/{len(normal_files)}\n")
             tf.write(f"gate_pass: {gate['overall_pass']}\n")
+            tf.write(f"gate_mode: {gate.get('mode', 'gate_v1')}\n")
             tf.write(f"train_non_empty_pass: {gate['train_non_empty_pass']}\n")
             tf.write(f"edge_box_pass: {gate['edge_box_pass']}\n")
+            tf.write(f"normal_fp_pass: {gate.get('normal_fp_pass', True)}\n")
+            tf.write(f"bbox_to_signal_pass: {gate.get('bbox_to_signal_pass', True)}\n")
             tf.write("localisation_summary:\n")
             for cls, splits in stats.items():
                 for split_name, (total, boxed, no_box) in splits.items():

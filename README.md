@@ -6,7 +6,7 @@
 
 A fully automated annotation pipeline that generates bounding-box labels for endoscopic images **without any manual annotation**. The system uses [PatchCore](https://arxiv.org/abs/2106.08265) anomaly detection with a ResNet50 backbone to localise pathological regions, then trains a [YOLOv11](https://docs.ultralytics.com/) object detector on the auto-generated labels.
 
-> **Status:** v13 advanced run completed (2026-03-14). Soft-border + dual-threshold extraction dramatically increased lesion coverage and passed the current gate, but Normal negative-control FP rose to 68.8% (22/32), making the gate criteria insufficient for trustworthy progression.
+> **Status:** v15 draft mode is now implemented as a governance upgrade over the v13 extraction stack. It adds gate-v2 constraints (Normal FP and bbox-to-signal control) so high-coverage but unsafe pseudo-label sets no longer pass by default.
 
 ---
 
@@ -75,6 +75,9 @@ pip install -r requirements.txt
 # Run the full pipeline (generate bboxes + train YOLO)
 python src/main.py --step all
 
+# Run v15 draft gate-v2 mode (v13 extraction + stricter governance)
+python src/main.py --step generate --v15-draft
+
 # Run with DINO backbone (v10 — requires GPU for fine-tuning)
 python src/main.py --step finetune --finetune-epochs 100
 python src/main.py --step all --backbone dino
@@ -123,6 +126,7 @@ The pipeline evolved through 13 versions across 5 tiers. See [VERSION_REGISTRY.m
 | v12 | 4 | Auto-calibration + backbone A/B | Blocked by gate | ImageNet selected; gate still fails (coverage/FP trade-off) |
 | v13 | 4 | Soft-border + dual-threshold extraction | Gate passed, clinically risky | 88.6% train non-empty labels but 68.8% Normal FP |
 | v14 | 5 | Hybrid PatchCore + Med-SAM refinement | Planned | Improve localization while controlling false positives |
+| v15 | 5 | Gate-v2 draft over v13 extraction stack | Draft implemented | Enforce Normal-control and pseudo-label expansion constraints |
 
 **Current finding:** v13 fixed under-coverage but over-expanded detections into Normal space. The pipeline now has a gate-design failure mode: it can pass quality checks while still generating high Normal false positives. Next iterations must tighten gate definitions (include Normal FP constraints) before any trusted YOLO retraining.
 

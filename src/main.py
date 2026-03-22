@@ -9,6 +9,9 @@ DINO_BACKBONE_PATH = os.path.join(
     'models', 'dino_resnet50.pth'
 )
 
+V15_DRAFT_MAX_NORMAL_FP_PCT = 20.0
+V15_DRAFT_MAX_BBOX_TO_SIGNAL_RATIO = 1.80
+
 
 def main():
     parser = argparse.ArgumentParser(description="Endoscopic AI Pipeline")
@@ -41,6 +44,9 @@ def main():
                         help="Run v12 advanced A/B sweep across backbones, then generate with best config.")
     parser.add_argument('--disable-v11-roi', action='store_true',
                         help="Disable v11 ROI mask and border rejection.")
+    parser.add_argument('--v15-draft', action='store_true',
+                        help="Enable v15 draft gate-v2 constraints (Normal FP + "
+                             "bbox-to-signal controls) while using current v13 extraction stack.")
 
     args = parser.parse_args()
 
@@ -51,7 +57,9 @@ def main():
             backbone_path = DINO_BACKBONE_PATH
 
     # Determine version tag for session
-    if args.v12_advanced:
+    if args.v15_draft:
+        version = 'v15'
+    elif args.v12_advanced:
         version = 'v13'
     else:
         version = 'v10' if backbone_path else 'v9'
@@ -107,6 +115,11 @@ def main():
                                         if best_cfg else args.calibration_percentile),
                 v11_mode=not args.disable_v11_roi,
                 v13_mode=True,
+                v15_mode=bool(args.v15_draft),
+                max_normal_fp_pct=(V15_DRAFT_MAX_NORMAL_FP_PCT
+                                   if args.v15_draft else None),
+                max_bbox_to_signal_ratio=(V15_DRAFT_MAX_BBOX_TO_SIGNAL_RATIO
+                                          if args.v15_draft else None),
             )
 
     if args.step in ['yolo', 'all']:

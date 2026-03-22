@@ -25,6 +25,7 @@ Usage
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -72,6 +73,33 @@ def parse_args():
 
 def _check_label_quality_gate():
     """Read generated labels and enforce no-go gate for resource savings."""
+    gate_json = os.path.join(PROJECT_ROOT, 'data', 'yolo_dataset', 'quality_gate.json')
+    if os.path.isfile(gate_json):
+        try:
+            with open(gate_json, encoding='utf-8') as f:
+                payload = json.load(f)
+            gate = payload.get('gate', {})
+            metrics = payload.get('metrics', {})
+            thresholds = gate.get('thresholds', {})
+            return {
+                'passed': bool(gate.get('overall_pass', False)),
+                'mode': gate.get('mode', 'gate_v1'),
+                'train_non_empty_pct': float(metrics.get('train', {}).get('non_empty_pct', 0.0)),
+                'overall_edge_box_pct': float(metrics.get('overall', {}).get('edge_box_pct', 100.0)),
+                'normal_fp_pct': float(metrics.get('normal_negative_control', {}).get('fp_pct', 100.0)),
+                'mean_bbox_to_signal_ratio': float(metrics.get('overall', {}).get('mean_bbox_to_signal_ratio', 0.0)),
+                'thresholds': {
+                    'min_non_empty_pct': thresholds.get('min_non_empty_pct', MIN_NON_EMPTY_PCT),
+                    'max_edge_box_pct': thresholds.get('max_edge_box_pct', MAX_EDGE_BOX_PCT),
+                    'max_normal_fp_pct': thresholds.get('max_normal_fp_pct'),
+                    'max_mean_bbox_to_signal_ratio': thresholds.get('max_mean_bbox_to_signal_ratio'),
+                }
+            }
+        except Exception:
+            # Fall back to legacy gate computation if the JSON is missing fields
+            # or malformed.
+            pass
+
     yolo_root = os.path.join(PROJECT_ROOT, 'data', 'yolo_dataset', 'labels')
     splits = ['train', 'val', 'test']
     total_boxes = 0
@@ -107,11 +135,16 @@ def _check_label_quality_gate():
               overall_edge_pct <= MAX_EDGE_BOX_PCT)
     return {
         'passed': passed,
+        'mode': 'gate_v1',
         'train_non_empty_pct': train_non_empty_pct,
         'overall_edge_box_pct': overall_edge_pct,
+        'normal_fp_pct': None,
+        'mean_bbox_to_signal_ratio': None,
         'thresholds': {
             'min_non_empty_pct': MIN_NON_EMPTY_PCT,
             'max_edge_box_pct': MAX_EDGE_BOX_PCT,
+            'max_normal_fp_pct': None,
+            'max_mean_bbox_to_signal_ratio': None,
         }
     }
 
@@ -122,10 +155,18 @@ def main(session=None):
     gate = _check_label_quality_gate()
     if not gate['passed'] and not args.force_bad_labels:
       print("ERROR: Label quality gate failed. Blocking YOLO training to save resources.")
+      print(f"  Gate mode: {gate.get('mode', 'gate_v1')}")
       print(f"  Train non-empty labels: {gate['train_non_empty_pct']:.2f}% "
           f"(min {gate['thresholds']['min_non_empty_pct']}%)")
       print(f"  Edge-centered boxes: {gate['overall_edge_box_pct']:.2f}% "
           f"(max {gate['thresholds']['max_edge_box_pct']}%)")
+      if gate.get('thresholds', {}).get('max_normal_fp_pct') is not None:
+          print(f"  Normal FP: {gate.get('normal_fp_pct', 100.0):.2f}% "
+                f"(max {gate['thresholds']['max_normal_fp_pct']}%)")
+      if gate.get('thresholds', {}).get('max_mean_bbox_to_signal_ratio') is not None:
+          print("  Mean bbox-to-signal ratio: "
+                f"{gate.get('mean_bbox_to_signal_ratio', 0.0):.3f} "
+                f"(max {gate['thresholds']['max_mean_bbox_to_signal_ratio']})")
       print("  Regenerate labels with improved v11/v12 settings before training.")
       sys.exit(1)
 
