@@ -9,8 +9,8 @@ DINO_BACKBONE_PATH = os.path.join(
     'models', 'dino_resnet50.pth'
 )
 
-V15_DRAFT_MAX_NORMAL_FP_PCT = 20.0
-V15_DRAFT_MAX_BBOX_TO_SIGNAL_RATIO = 1.80
+V14_DRAFT_MAX_NORMAL_FP_PCT = 20.0
+V14_DRAFT_MAX_BBOX_TO_SIGNAL_RATIO = 1.80
 
 
 def main():
@@ -44,8 +44,8 @@ def main():
                         help="Run v12 advanced A/B sweep across backbones, then generate with best config.")
     parser.add_argument('--disable-v11-roi', action='store_true',
                         help="Disable v11 ROI mask and border rejection.")
-    parser.add_argument('--v15-draft', action='store_true',
-                        help="Enable v15 draft gate-v2 constraints (Normal FP + "
+    parser.add_argument('--v14-draft', action='store_true',
+                        help="Enable v14 draft gate-v2 constraints (Normal FP + "
                              "bbox-to-signal controls) while using current v13 extraction stack.")
 
     args = parser.parse_args()
@@ -57,8 +57,8 @@ def main():
             backbone_path = DINO_BACKBONE_PATH
 
     # Determine version tag for session
-    if args.v15_draft:
-        version = 'v15'
+    if args.v14_draft:
+        version = 'v14'
     elif args.v12_advanced:
         version = 'v13'
     else:
@@ -115,11 +115,11 @@ def main():
                                         if best_cfg else args.calibration_percentile),
                 v11_mode=not args.disable_v11_roi,
                 v13_mode=True,
-                v15_mode=bool(args.v15_draft),
-                max_normal_fp_pct=(V15_DRAFT_MAX_NORMAL_FP_PCT
-                                   if args.v15_draft else None),
-                max_bbox_to_signal_ratio=(V15_DRAFT_MAX_BBOX_TO_SIGNAL_RATIO
-                                          if args.v15_draft else None),
+                v14_mode=bool(args.v14_draft),
+                max_normal_fp_pct=(V14_DRAFT_MAX_NORMAL_FP_PCT
+                                   if args.v14_draft else None),
+                max_bbox_to_signal_ratio=(V14_DRAFT_MAX_BBOX_TO_SIGNAL_RATIO
+                                          if args.v14_draft else None),
             )
 
     if args.step in ['yolo', 'all']:

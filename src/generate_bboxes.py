@@ -204,11 +204,11 @@ ENABLE_V13_DUAL_THRESH = True
 DUAL_THRESH_LOW_RATIO  = 0.55   # low threshold = high_threshold * ratio
 DUAL_THRESH_LOW_FLOOR  = 0.015  # absolute floor for grow mask
 
-# ── v15 draft gate-v2 constraints ───────────────────────────────────────────
+# ── v14 draft gate-v2 constraints ───────────────────────────────────────────
 # Governance-focused draft constraints to avoid accepting high-coverage
 # pseudo-label sets that collapse specificity on Normal controls.
-V15_MAX_NORMAL_FP_PCT = 20.0
-V15_MAX_BBOX_TO_SIGNAL_RATIO = 1.80
+V14_MAX_NORMAL_FP_PCT = 20.0
+V14_MAX_BBOX_TO_SIGNAL_RATIO = 1.80
 
 # ImageNet normalisation required for pretrained ResNet weights
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -1178,7 +1178,7 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
                      anom_floor=None, anom_margin=None,
                      calibration_percentile=99, v11_mode=True,
                      v13_mode=True,
-                     v15_mode=False,
+                     v14_mode=False,
                      min_non_empty_pct=30.0, max_edge_box_pct=20.0,
                      max_normal_fp_pct=None,
                      max_bbox_to_signal_ratio=None):
@@ -1229,11 +1229,11 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
 
     # ── Determine version and tier based on backbone selection ───────────────
     if backbone_path is not None:
-        _version = 'v15' if v15_mode else ('v13' if v13_mode else ('v11' if v11_mode else 'v10'))
+        _version = 'v14' if v14_mode else ('v13' if v13_mode else ('v11' if v11_mode else 'v10'))
         _tier = 'Tier3_DINO'
         _backbone_label = f'DINO ({os.path.basename(backbone_path)})'
     else:
-        _version = 'v15' if v15_mode else ('v13' if v13_mode else ('v11' if v11_mode else 'v9'))
+        _version = 'v14' if v14_mode else ('v13' if v13_mode else ('v11' if v11_mode else 'v9'))
         _tier = 'Tier2_Layer4'
         _backbone_label = 'ImageNet (default)'
 
@@ -1271,9 +1271,9 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
             'ENABLE_FOV_MASK': bool(v11_mode),
             'ENABLE_V13_SOFT_BORDER': bool(v13_mode),
             'ENABLE_V13_DUAL_THRESH': bool(v13_mode),
-            'ENABLE_V15_DRAFT': bool(v15_mode),
-            'V15_MAX_NORMAL_FP_PCT': max_normal_fp_pct,
-            'V15_MAX_MEAN_BBOX_TO_SIGNAL_RATIO': max_bbox_to_signal_ratio,
+            'ENABLE_V14_DRAFT': bool(v14_mode),
+            'V14_MAX_NORMAL_FP_PCT': max_normal_fp_pct,
+            'V14_MAX_MEAN_BBOX_TO_SIGNAL_RATIO': max_bbox_to_signal_ratio,
         }, session=session)
         vis_dir_root = os.path.join(run_dir, 'visualizations')
     except ImportError:
@@ -1644,7 +1644,7 @@ def generate_dataset(rebuild_bank=False, session=None, backbone_path=None,
         'calibration_percentile': calibration_percentile,
         'v11_mode': bool(v11_mode),
         'v13_mode': bool(v13_mode),
-        'v15_mode': bool(v15_mode),
+        'v14_mode': bool(v14_mode),
         'stats': stats,
         'normal_negative_control': {
             'false_positives': false_pos,
